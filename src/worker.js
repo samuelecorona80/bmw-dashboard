@@ -53,13 +53,23 @@ function jsonResponse(data, status = 200, cors = {}) {
   });
 }
 
+function dateKeyInRome(value = new Date()) {
+  const d = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(d.getTime())) return String(value || '').substring(0, 10);
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Europe/Rome', year: 'numeric', month: '2-digit', day: '2-digit'
+  }).formatToParts(d);
+  const get = type => (parts.find(p => p.type === type) || {}).value || '';
+  return `${get('year')}-${get('month')}-${get('day')}`;
+}
+
 // ─────────────────────────────────────────────
 // POST handler — receives snapshot data
 // ─────────────────────────────────────────────
 async function handlePost(request, env, cors) {
   const body = await request.json();
   const snapshotTs = body.snapshot_timestamp || new Date().toISOString();
-  const snapshotDate = snapshotTs.substring(0, 10);
+  const snapshotDate = dateKeyInRome(snapshotTs);
   const entities = body.entities || [];
   const triggerReason = body.trigger_reason || 'scheduled';
 
@@ -230,6 +240,66 @@ async function handleGetData(env, cors) {
       rrBar: bar(d['X3 M40d Tire pressure (rear right)'] || d['Rear Right Pressure kPa'])
     };
   });
+  // Resolve odometer from all available feeds instead of trusting only the
+  // current BMW/HA entity, which can remain stale after a drive.
+  const todayRome = dateKeyInRome(new Date());
+  const mileageEvents = [];
+  const pushMileage = (km, timestamp, source) => {
+    const n = Number(km);
+    if (!Number.isFinite(n) || n <= 0 || !timestamp) return;
+    mileageEvents.push({ km: n, timestamp, source, date: dateKeyInRome(timestamp) });
+  };
+  try {
+    const rawMileage = await db.prepare(
+      `SELECT snapshot_timestamp, state, bmw_timestamp
+       FROM bmw_raw_daily
+       WHERE entity_id = 'sensor.x3_m40d_vehicle_mileage'
+       ORDER BY snapshot_timestamp DESC LIMIT 400`
+    ).all();
+    for (const r of rawMileage.results) pushMileage(r.state, r.bmw_timestamp || r.snapshot_timestamp, 'BMW/HA');
+  } catch (_) {}
+  try {
+    const cardataMileage = await db.prepare(
+      `SELECT c_timestamp, travelled_distance
+       FROM bmw_cardata_raw
+       WHERE travelled_distance IS NOT NULL
+       ORDER BY c_timestamp DESC LIMIT 400`
+    ).all();
+    for (const r of cardataMileage.results) pushMileage(r.travelled_distance, r.c_timestamp, 'CarData');
+  } catch (_) {}
+  for (const r of dailyRows.results) {
+    if (r.mileage_km !== null && r.mileage_km !== undefined) {
+      pushMileage(r.mileage_km, r.snapshot_timestamp || (r.snapshot_date + 'T12:00:00Z'), 'Daily');
+    }
+  }
+
+  const currentMileageEntity = current['sensor.x3_m40d_vehicle_mileage'];
+  if (currentMileageEntity) {
+    pushMileage(
+      currentMileageEntity.value,
+      currentMileageEntity.bmw_timestamp || currentMileageEntity.last_updated || new Date().toISOString(),
+      'BMW/HA'
+    );
+  }
+
+  mileageEvents.sort((a,b) => new Date(a.timestamp) - new Date(b.timestamp));
+  const maxMileageEvent = events => {
+    if (!events.length) return null;
+    const maxKm = Math.max(...events.map(e => e.km));
+    const matching = events.filter(e => Math.abs(e.km - maxKm) < 0.01);
+    return matching[matching.length - 1] || null;
+  };
+  const currentMileageEvent = maxMileageEvent(mileageEvents);
+  const beforeTodayEvent = maxMileageEvent(mileageEvents.filter(e => e.date < todayRome));
+  let resolvedDailyKm = null;
+  if (currentMileageEvent && beforeTodayEvent) {
+    const d = currentMileageEvent.km - beforeTodayEvent.km;
+    if (d >= 0 && d < 1500) resolvedDailyKm = Math.round(d * 10) / 10;
+  }
+  const mileageAgeHours = currentMileageEvent
+    ? Math.max(0, (Date.now() - new Date(currentMileageEvent.timestamp).getTime()) / 3600000)
+    : null;
+
 
   // Helper functions
   const row = id => current[id] || {};
@@ -304,7 +374,7 @@ async function handleGetData(env, cors) {
   // Calculate distance this month from bmw_daily (more accurate than BMW entity)
   let distanceThisMonth = 0;
   try {
-    const nowStr = new Date().toISOString();
+    const nowStr = dateKeyInRome(new Date());
     const monthStart = nowStr.substring(0, 8) + '01';
     const monthDailyRows = dailyRows.results.filter(r => r.snapshot_date >= monthStart && r.mileage_km);
     if (monthDailyRows.length > 0) {
@@ -328,7 +398,9 @@ async function handleGetData(env, cors) {
     generatedAt: new Date().toISOString(),
     vehicle: { name: 'BMW X3 M40d', generation: 'G01', subtitle: 'My Vehicle Dashboard' },
     core: {
-      mileageKm: toNum(state(mileageId)),
+      mileageKm: currentMileageEvent ? currentMileageEvent.km : toNum(state(mileageId)),
+      mileageSource: currentMileageEvent ? currentMileageEvent.source : 'BMW/HA',
+      mileageUpdatedAt: currentMileageEvent ? currentMileageEvent.timestamp : ts(mileageId),
       fuelPercent: toNum(state('sensor.x3_m40d_range_tank_level')),
       fuelLitres: toNum(state('sensor.x3_m40d_range_tank_level_2')),
       rangeKm: toNum(state('sensor.x3_m40d_range_total_range_last_sent')),
@@ -386,14 +458,11 @@ async function handleGetData(env, cors) {
     trip,
     analytics,
     quick: {
-      dailyKm: (() => {
-        const todayStr = new Date().toISOString().substring(0, 10);
-        const todayRow = dailyRows.results.find(r => r.snapshot_date === todayStr);
-        if (todayRow && todayRow.daily_distance_km !== null && todayRow.daily_distance_km !== undefined) {
-          return todayRow.daily_distance_km;
-        }
-        return 0;
-      })(),
+      dailyKm: resolvedDailyKm,
+      dailyKmSource: currentMileageEvent ? currentMileageEvent.source : null,
+      dailyKmUpdatedAt: currentMileageEvent ? currentMileageEvent.timestamp : null,
+      dailyKmStale: mileageAgeHours !== null ? mileageAgeHours > 6 : true,
+      dailyKmBaseline: beforeTodayEvent ? beforeTodayEvent.km : null,
       consumptionL100: analytics.consumption.latest,
       ecoProPercent: ecoPro,
       vehicleState: tripInProgress ? 'In viaggio' : normalizeLocation(locationState)
@@ -2021,7 +2090,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
          </div>
       </article>
       <article class="card mileage-card">
-        <div class="card-kicker">Km giornalieri</div>
+        <div class="card-kicker">Chilometraggio totale</div>
         <div class="big-number"><span id="mileage">—</span><small> km</small></div>
         <div class="mini-note">Baseline pneumatici: ~79.000 km</div>
         <canvas id="mileageChart" height="120"></canvas>
@@ -2284,8 +2353,9 @@ function renderDashboard(d){
   $('rangeKm').textContent=fmtInt(d.core.rangeKm);
   $('fuelLastUpdate').textContent=d.core.lastBmwTimestamp?'Ultimo agg. '+formatTimestamp(d.core.lastBmwTimestamp):'';
   $('fuelBar').style.width=\`\${Math.max(0,Math.min(100,Number(d.core.fuelPercent)||0))}%\`;
-  $('lastBmw').textContent=dateTime(d.core.lastBmwTimestamp);
-  $('freshness').innerHTML=\`<i></i>\${escapeHtml(ageLabel(d.core.lastBmwTimestamp))}\`;
+  var mileageTs=d.core.mileageUpdatedAt||d.core.lastBmwTimestamp;
+  $('lastBmw').textContent=dateTime(mileageTs);
+  $('freshness').innerHTML=\`<i></i>\${escapeHtml(ageLabel(mileageTs))}\`;
   $('homePill').textContent=\`● \${locationLabel(d.core.locationState)}\`;
   // Status banner rendering
   var lkV = (d.security.lockState || '').toUpperCase();
@@ -2446,7 +2516,16 @@ function renderDashboard(d){
 
 function renderQuickStats(d){
   $('quickKm').textContent=d.quick.dailyKm===null?'—':\`\${fmt1(d.quick.dailyKm)} km\`;
-  $('quickKmNote').textContent=d.quick.dailyKm===null?'in attesa di più dati':(d.quick.dailyKm===0?'nessun viaggio oggi':'distanza odierna');
+  if(d.quick.dailyKm===null){
+    $('quickKmNote').textContent='baseline odometro non disponibile';
+  }else if(d.quick.dailyKmStale){
+    $('quickKmNote').textContent=(d.quick.dailyKm>0?'almeno ':'')+fmt1(d.quick.dailyKm)+' km · odometro da aggiornare';
+  }else if(d.quick.dailyKm===0){
+    $('quickKmNote').textContent='nessun incremento odometro rilevato oggi';
+  }else{
+    var src=d.quick.dailyKmSource?(' · '+d.quick.dailyKmSource):'';
+    $('quickKmNote').textContent='distanza odierna'+src;
+  }
   $('quickConsumption').textContent=d.quick.consumptionL100===null?'—':fmt1(d.quick.consumptionL100);
   if (d.analytics && d.analytics.consumption && d.analytics.consumption.points && d.analytics.consumption.points.length > 0) {
     const lastPt = d.analytics.consumption.points[d.analytics.consumption.points.length-1];
