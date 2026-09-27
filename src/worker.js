@@ -300,6 +300,41 @@ async function handleGetData(env, cors) {
     ? Math.max(0, (Date.now() - new Date(currentMileageEvent.timestamp).getTime()) / 3600000)
     : null;
 
+  const progress = [];
+  let runningMax = null;
+  for (const e of mileageEvents) {
+    if (runningMax === null || e.km > runningMax + 0.01) {
+      runningMax = e.km;
+      progress.push(e);
+    }
+  }
+  let lastMovement = null;
+  if (progress.length >= 2) {
+    const last = progress[progress.length - 1];
+    const prev = progress[progress.length - 2];
+    const moved = last.km - prev.km;
+    if (moved > 0 && moved < 1000) lastMovement = { distanceKm: Math.round(moved * 10) / 10, timestamp: last.timestamp, source: last.source, odometerKm: last.km };
+  }
+
+  let milestone81000 = null;
+  if (currentMileageEvent) {
+    const targetKm = 81000;
+    const remainingKm = Math.max(0, targetKm - currentMileageEvent.km);
+    const cutoff = Date.now() - 30 * 86400000;
+    const recent = mileageEvents.filter(e => new Date(e.timestamp).getTime() >= cutoff && e.km <= currentMileageEvent.km);
+    const earliest = recent.length ? recent[0] : null;
+    let avgKmPerDay = null;
+    if (earliest && currentMileageEvent.km >= earliest.km) {
+      const spanDays = Math.max(1, (new Date(currentMileageEvent.timestamp) - new Date(earliest.timestamp)) / 86400000);
+      avgKmPerDay = (currentMileageEvent.km - earliest.km) / spanDays;
+      if (!(avgKmPerDay > 0)) avgKmPerDay = null;
+    }
+    let estimatedDate = null;
+    if (remainingKm === 0) estimatedDate = currentMileageEvent.timestamp;
+    else if (avgKmPerDay) estimatedDate = new Date(Date.now() + (remainingKm / avgKmPerDay) * 86400000).toISOString();
+    milestone81000 = { targetKm, remainingKm: Math.round(remainingKm), avgKmPerDay: avgKmPerDay ? Math.round(avgKmPerDay * 10) / 10 : null, estimatedDate };
+  }
+
 
   // Helper functions
   const row = id => current[id] || {};
@@ -344,6 +379,24 @@ async function handleGetData(env, cors) {
   };
   tyres.alerts = { ...flags, any: Object.values(flags).some(Boolean), deviations };
 
+  const previousTyreValue = key => {
+    for (let i = history.length - 1; i >= 0; i--) {
+      const h = history[i];
+      if (dateKeyInRome(h.timestamp) >= todayRome) continue;
+      if (h[key] !== null && h[key] !== undefined) return h[key];
+    }
+    return null;
+  };
+  const tyreTrend = {
+    frontLeft: delta(tyres.frontLeft, previousTyreValue('flBar')),
+    frontRight: delta(tyres.frontRight, previousTyreValue('frBar')),
+    rearLeft: delta(tyres.rearLeft, previousTyreValue('rlBar')),
+    rearRight: delta(tyres.rearRight, previousTyreValue('rrBar'))
+  };
+  const trendFlags = Object.fromEntries(Object.entries(tyreTrend).map(([k,v]) => [k, v !== null && Math.abs(v) >= 0.2]));
+  tyres.trend = tyreTrend;
+  tyres.trendAlerts = { ...trendFlags, any: Object.values(trendFlags).some(Boolean) };
+
   // Trip
   const clamp = v => { const n=toNum(v); return n===null?0:Math.max(0,Math.min(100,n)); };
   const ecoPro = clamp(state('sensor.x3_m40d_trip_eco_pro_mode_share'));
@@ -360,15 +413,22 @@ async function handleGetData(env, cors) {
 
   // GPS location
   let locationCoords = null;
+  let locationTimestamp = null;
   try {
     const locRow = rows.find(r => r.entity_id === 'device_tracker.x3_m40d');
     if (locRow && locRow.attributes_json) {
       const a = JSON.parse(locRow.attributes_json);
-      if (a.latitude && a.longitude) locationCoords = { lat: a.latitude, lng: a.longitude, heading: a.heading || null };
+      if (a.latitude && a.longitude) {
+        locationCoords = { lat: a.latitude, lng: a.longitude, heading: a.heading || null };
+        locationTimestamp = locRow.bmw_timestamp || locRow.last_updated || null;
+      }
     }
     if (!locationCoords) {
-      const cdRow = await db.prepare('SELECT latitude, longitude, heading FROM bmw_cardata_raw WHERE latitude IS NOT NULL ORDER BY c_timestamp DESC LIMIT 1').first();
-      if (cdRow) locationCoords = { lat: cdRow.latitude, lng: cdRow.longitude, heading: cdRow.heading || null };
+      const cdRow = await db.prepare('SELECT latitude, longitude, heading, c_timestamp FROM bmw_cardata_raw WHERE latitude IS NOT NULL ORDER BY c_timestamp DESC LIMIT 1').first();
+      if (cdRow) {
+        locationCoords = { lat: cdRow.latitude, lng: cdRow.longitude, heading: cdRow.heading || null };
+        locationTimestamp = cdRow.c_timestamp || null;
+      }
     }
   } catch(_) {}
   // Calculate distance this month from bmw_daily (more accurate than BMW entity)
@@ -404,6 +464,7 @@ async function handleGetData(env, cors) {
       fuelPercent: toNum(state('sensor.x3_m40d_range_tank_level')),
       fuelLitres: toNum(state('sensor.x3_m40d_range_tank_level_2')),
       rangeKm: toNum(state('sensor.x3_m40d_range_total_range_last_sent')),
+      fuelTimestamp: ts('sensor.x3_m40d_range_tank_level') || ts('sensor.x3_m40d_range_total_range_last_sent'),
       lastBmwTimestamp: ts(mileageId),
       lastHaUpdated: row(mileageId).lastUpdated || null,
       locationState
@@ -467,7 +528,9 @@ async function handleGetData(env, cors) {
       ecoProPercent: ecoPro,
       vehicleState: tripInProgress ? 'In viaggio' : normalizeLocation(locationState)
     },
-    location: locationCoords,
+    location: locationCoords ? { ...locationCoords, timestamp: locationTimestamp } : null,
+    lastMovement,
+    milestone81000,
     distanceThisMonth,
     costs: {
       dieselPriceEur: dieselPriceEur,
@@ -1975,7 +2038,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 .ambient{position:fixed;filter:blur(90px);opacity:.18;pointer-events:none;border-radius:50%}.ambient-a{width:360px;height:360px;background:#277eff;top:120px;left:-150px}.ambient-b{width:420px;height:420px;background:#0ad0a0;right:-220px;top:500px}.shell{width:min(1240px,calc(100% - 28px));margin:0 auto;padding:22px 0 36px;position:relative;z-index:2}
 .topbar{display:flex;justify-content:space-between;align-items:center;padding:6px 8px 22px}.brand{display:flex;align-items:center;gap:14px}.brand-title{font-size:27px;font-weight:800}.brand-sub{color:var(--muted);font-size:14px}.roundel{width:54px;height:54px;border:3px solid #fff;border-radius:50%;background:conic-gradient(#fff 0 25%,#2494ff 0 50%,#fff 0 75%,#2494ff 0);box-shadow:0 0 0 3px #17202c inset}.top-status{display:flex;align-items:center;gap:14px}.eyebrow{font-size:12px;color:#9fb2c7;text-transform:uppercase;letter-spacing:.12em}.time{font-weight:700;margin-top:3px}.freshness{font-size:12px;color:var(--green);margin-top:5px}.freshness i{display:inline-block;width:8px;height:8px;background:var(--green);border-radius:50%;margin-right:6px}.refresh{width:42px;height:42px;border-radius:14px;border:1px solid var(--line);background:#10233a;color:#d9e8f8;font-size:23px;cursor:pointer}.refresh:hover{background:#153151}
 .card{background:linear-gradient(180deg,rgba(17,37,60,.94),rgba(8,22,38,.94));border:1px solid rgba(74,112,148,.42);border-radius:20px;box-shadow:0 20px 60px rgba(0,0,0,.18);overflow:hidden}.hero-grid{display:grid;grid-template-columns:minmax(0,1.5fr) minmax(310px,.7fr);gap:16px}.hero-card{min-height:330px;position:relative;padding:36px;display:flex;align-items:center;background:linear-gradient(90deg,rgba(8,20,34,.95),rgba(8,20,34,.55)),radial-gradient(circle at 70% 35%,rgba(57,117,171,.35),transparent 45%),#0a1726}.hero-copy{position:relative;z-index:3;max-width:410px}.hero-copy h1{font-size:56px;line-height:.96;margin:12px 0 18px;font-weight:300;letter-spacing:-.04em}.hero-copy h1 span{color:#dce8f6}.hero-copy p{color:#b9c8d8;max-width:360px;line-height:1.5}.hero-pills{display:flex;gap:8px;flex-wrap:wrap;margin-top:22px}.pill{padding:8px 11px;border-radius:999px;border:1px solid #355677;background:rgba(15,39,63,.8);font-size:12px;color:#c8d7e8}.car-side{position:absolute;right:0;bottom:0;width:55%;opacity:.92;overflow:hidden;border-radius:0 0 20px 0}.car-side svg{width:100%;display:block}.mileage-card{padding:24px}.card-kicker{font-weight:750;font-size:15px;margin-bottom:14px}.big-number{font-size:44px;font-weight:800;letter-spacing:-.04em}.big-number small,.medium-number small,.analytics-value small{font-size:.45em;color:#d9e5f2}.mini-note{color:var(--muted);font-size:12px;line-height:1.45}.mileage-card canvas{margin-top:16px;max-height:150px}
-.quick-stats{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-top:16px}.quick-card{min-height:104px;border:1px solid rgba(74,112,148,.38);border-radius:17px;background:linear-gradient(180deg,rgba(16,37,60,.88),rgba(9,24,40,.9));padding:16px;display:flex;align-items:center;gap:13px}.quick-icon{font-size:25px;filter:saturate(.85)}.quick-card small,.quick-card strong,.quick-card em{display:block}.quick-card small{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.08em}.quick-card strong{font-size:24px;margin:3px 0 1px}.quick-card em{font-size:10px;color:#7890a7;font-style:normal}
+.quick-stats{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-top:16px}.quick-card{min-height:104px;border:1px solid rgba(74,112,148,.38);border-radius:17px;background:linear-gradient(180deg,rgba(16,37,60,.88),rgba(9,24,40,.9));padding:16px;display:flex;align-items:center;gap:13px}.insight-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:16px}.insight-card{padding:18px 20px}.insight-card strong{display:block;font-size:24px;letter-spacing:-.03em;margin:4px 0 6px}.quick-icon{font-size:25px;filter:saturate(.85)}.quick-card small,.quick-card strong,.quick-card em{display:block}.quick-card small{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.08em}.quick-card strong{font-size:24px;margin:3px 0 1px}.quick-card em{font-size:10px;color:#7890a7;font-style:normal}
 .summary-grid{display:grid;grid-template-columns:.78fr 1.05fr .65fr;gap:16px;margin-top:16px}.summary-grid .card{padding:24px}.metric-row{display:flex;align-items:baseline;gap:30px}.medium-number{font-size:40px;font-weight:800}.side-value{font-size:22px;font-weight:700;color:#d5e1ee}.progress{height:13px;border-radius:99px;background:#213951;margin:18px 0;overflow:hidden}.progress span{display:block;height:100%;width:0;background:linear-gradient(90deg,#53d79d,#4bd2bd);border-radius:99px;transition:width .6s}.submetric{display:flex;justify-content:space-between;align-items:end;color:var(--muted);font-size:13px}.submetric strong{display:block;color:white;font-size:24px}.status-main{font-size:27px;color:var(--green);font-weight:800;margin:-2px 0 12px}.check-list{display:grid;grid-template-columns:1fr 1fr;gap:10px 14px}.check-list div{display:flex;align-items:center;gap:8px;color:#d4dfeb;font-size:13px}.check-list b{width:24px;height:24px;display:grid;place-items:center;background:#1b6744;color:#8bf2a9;border-radius:50%;font-size:12px}.battery-card{text-align:center}.ok-disc{width:68px;height:68px;margin:4px auto 14px;border-radius:50%;display:grid;place-items:center;background:var(--green);color:#042416;font-size:34px;font-weight:900}.battery-msg{font-size:18px;font-weight:750;margin-bottom:14px}
 .advanced-grid{display:grid;grid-template-columns:1fr 1fr .82fr;gap:16px;margin-top:16px}.analytics-card,.trip-card{padding:22px;min-height:310px}.analytics-head{display:flex;align-items:flex-start;justify-content:space-between;gap:15px}.analytics-value{font-size:34px;font-weight:800;letter-spacing:-.03em}.analytics-average{font-size:11px;color:var(--muted);text-align:right}.analytics-average strong{display:block;color:#dce7f3;font-size:18px;margin-top:3px}.chart-holder{position:relative;height:185px;margin-top:16px}.chart-holder canvas{height:185px!important}.empty-state{position:absolute;inset:0;display:grid;place-items:center;text-align:center;color:var(--muted);border:1px dashed rgba(96,129,160,.35);border-radius:14px;background:rgba(7,18,30,.34);font-size:13px;padding:18px}.hidden{display:none!important}
 .trip-layout{display:grid;grid-template-columns:155px 1fr;align-items:center;gap:12px;height:230px}.donut-wrap{position:relative;width:150px;height:150px;margin:auto}.donut-wrap canvas{width:150px!important;height:150px!important}.donut-center{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;flex-direction:column;pointer-events:none}.donut-center strong{font-size:14px}.donut-center span{font-size:10px;color:var(--muted)}.trip-legend{display:grid;gap:11px}.trip-legend div{display:grid;grid-template-columns:9px 1fr auto;gap:8px;align-items:center;font-size:12px;color:#cdd9e5}.trip-legend i{width:9px;height:9px;border-radius:50%}.trip-legend strong{font-size:12px}.trip-legend .eco{background:#59d989}.trip-legend .eco-plus{background:#83e0c3}.trip-legend .electric{background:#4e9cff}.trip-legend .normal{background:#8497ac}
@@ -1984,7 +2047,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 @media(max-width:1050px){.advanced-grid{grid-template-columns:1fr 1fr}.trip-card{grid-column:1/-1}.trip-layout{grid-template-columns:170px 1fr;max-width:520px;margin:auto}}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
 @media(max-width:900px){.shell{width:min(100% - 18px,760px);padding-top:12px}.topbar{align-items:flex-start}.brand-title{font-size:22px}.roundel{width:45px;height:45px}.hero-grid,.lower-grid,.charts-grid{grid-template-columns:1fr}.hero-card{min-height:420px;padding:26px}.hero-copy h1{font-size:45px}.car-side{width:92%;right:-16%;opacity:.65}.quick-stats{grid-template-columns:1fr 1fr}.summary-grid{grid-template-columns:1fr 1fr}.security-card{grid-column:1/-1}.advanced-grid{grid-template-columns:1fr}.trip-card{grid-column:auto}.tyres-layout{grid-template-columns:1fr 150px 1fr;height:340px}.top-car{width:115px;height:285px}.check-list{grid-template-columns:1fr}.charts-grid{grid-template-columns:1fr}.footer{grid-template-columns:1fr;gap:15px}.footer div{border-right:0;border-bottom:1px solid #20394f;padding:0 8px 15px}.footer div:last-child{border-bottom:0}.top-status .eyebrow,.top-status .time{display:none}}
-@media(max-width:560px){.summary-grid,.quick-stats{grid-template-columns:1fr}.security-card{grid-column:auto}.hero-card{min-height:380px}.hero-copy h1{font-size:39px}.car-side{bottom:10px;right:-27%;width:118%}.quick-card{min-height:82px}.tyres-layout{grid-template-columns:1fr 105px 1fr;gap:6px;height:310px}.top-car{width:82px;height:240px}.car-roof{left:14px;right:14px}.tyre-metric{padding:6px}.tyre-metric strong{font-size:24px}.tyre-metric span{font-size:11px}.trip-layout{grid-template-columns:1fr;height:auto}.donut-wrap{margin:4px auto 16px}.footer{padding-top:18px}}
+@media(max-width:560px){.summary-grid{grid-template-columns:1fr}.quick-stats{grid-template-columns:repeat(2,minmax(0,1fr))}.quick-card:last-child{grid-column:1/-1}.insight-grid{grid-template-columns:1fr 1fr}.insight-card{padding:14px}.insight-card strong{font-size:20px}.security-card{grid-column:auto}.hero-card{min-height:380px}.hero-copy h1{font-size:39px}.car-side{bottom:10px;right:-27%;width:118%}.quick-card{min-height:82px}.tyres-layout{grid-template-columns:1fr 105px 1fr;gap:6px;height:310px}.top-car{width:82px;height:240px}.car-roof{left:14px;right:14px}.tyre-metric{padding:6px}.tyre-metric strong{font-size:24px}.tyre-metric span{font-size:11px}.trip-layout{grid-template-columns:1fr;height:auto}.donut-wrap{margin:4px auto 16px}.footer{padding-top:18px}}
 
 
 /* Period selector */
@@ -2124,6 +2187,11 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       <article class="quick-card"><span class="quick-icon">🅿️</span><div><small>Stato</small><strong id="quickStatus">—</strong><em id="quickStatusNote">stato corrente</em></div></article>
     </section>
 
+    <section class="insight-grid">
+      <article class="card insight-card"><div class="card-kicker">Ultimo movimento</div><strong id="lastMoveDistance">—</strong><div class="mini-note" id="lastMoveNote">In attesa di dati odometro</div></article>
+      <article class="card insight-card"><div class="card-kicker">Verso 81.000 km</div><strong id="milestoneRemaining">—</strong><div class="mini-note" id="milestoneNote">Stima in preparazione</div></article>
+    </section>
+
     <section class="summary-grid">
       <article class="card" style="padding:24px">
         <div class="card-kicker">Carburante</div>
@@ -2188,11 +2256,11 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
         <div class="section-head"><div><div class="card-kicker">Pneumatici</div><div class="mini-note">Pneumatici nuovi da ~1 settimana, ant. ~500 km, post. ~200 km</div></div><div class="tiny-time" id="tyreTimestamp">—</div></div>
         <div class="tyre-alert-summary hidden" id="tyreAlertSummary">⚠ Pressione fuori target di oltre 0,5 bar</div>
         <div class="tyres-layout">
-          <div class="tyre-metric fl" id="tyreFL"><span>Ant. sinistra</span><strong><span id="fl">—</span> bar</strong><small>Target <span id="tfl">—</span> bar</small><b class="pressure-badge" id="flAlert">OK</b></div>
-          <div class="tyre-metric fr" id="tyreFR"><span>Ant. destra</span><strong><span id="fr">—</span> bar</strong><small>Target <span id="tfr">—</span> bar</small><b class="pressure-badge" id="frAlert">OK</b></div>
+          <div class="tyre-metric fl" id="tyreFL"><span>Ant. sinistra</span><strong><span id="fl">—</span> bar</strong><small>Target <span id="tfl">—</span> · Δ <span id="flTrend">—</span></small><b class="pressure-badge" id="flAlert">OK</b></div>
+          <div class="tyre-metric fr" id="tyreFR"><span>Ant. destra</span><strong><span id="fr">—</span> bar</strong><small>Target <span id="tfr">—</span> · Δ <span id="frTrend">—</span></small><b class="pressure-badge" id="frAlert">OK</b></div>
           <div class="top-car" aria-hidden="true"><div class="car-roof"></div><div class="wheel w1"></div><div class="wheel w2"></div><div class="wheel w3"></div><div class="wheel w4"></div></div>
-          <div class="tyre-metric rl" id="tyreRL"><span>Post. sinistra</span><strong><span id="rl">—</span> bar</strong><small>Target <span id="trl">—</span> bar</small><b class="pressure-badge" id="rlAlert">OK</b></div>
-          <div class="tyre-metric rr" id="tyreRR"><span>Post. destra</span><strong><span id="rr">—</span> bar</strong><small>Target <span id="trr">—</span> bar</small><b class="pressure-badge" id="rrAlert">OK</b></div>
+          <div class="tyre-metric rl" id="tyreRL"><span>Post. sinistra</span><strong><span id="rl">—</span> bar</strong><small>Target <span id="trl">—</span> · Δ <span id="rlTrend">—</span></small><b class="pressure-badge" id="rlAlert">OK</b></div>
+          <div class="tyre-metric rr" id="tyreRR"><span>Post. destra</span><strong><span id="rr">—</span> bar</strong><small>Target <span id="trr">—</span> · Δ <span id="rrTrend">—</span></small><b class="pressure-badge" id="rrAlert">OK</b></div>
         </div>
       </article>
       <div class="side-stack">
@@ -2351,7 +2419,7 @@ function renderDashboard(d){
   $('fuelPercent').textContent=fmtInt(d.core.fuelPercent);
   $('fuelLitres').textContent=fmtInt(d.core.fuelLitres);
   $('rangeKm').textContent=fmtInt(d.core.rangeKm);
-  $('fuelLastUpdate').textContent=d.core.lastBmwTimestamp?'Ultimo agg. '+formatTimestamp(d.core.lastBmwTimestamp):'';
+  $('fuelLastUpdate').textContent=d.core.fuelTimestamp?'Ultimo agg. '+formatTimestamp(d.core.fuelTimestamp)+' · '+ageLabel(d.core.fuelTimestamp):'';
   $('fuelBar').style.width=\`\${Math.max(0,Math.min(100,Number(d.core.fuelPercent)||0))}%\`;
   var mileageTs=d.core.mileageUpdatedAt||d.core.lastBmwTimestamp;
   $('lastBmw').textContent=dateTime(mileageTs);
@@ -2413,7 +2481,7 @@ function renderDashboard(d){
   boolIcon('hoodIcon',d.security.hoodClosed); boolIcon('tailgateIcon',d.security.tailgateClosed); boolIcon('sunroofIcon',d.security.sunroofClosed);
 
   const battOk=d.battery12v.rechargeRequired===0||d.battery12v.rechargeRequired===null;
-  $('batteryDisc').textContent=battOk?'✓':'!'; $('batteryDisc').style.background=battOk?'var(--green)':'var(--amber)';
+  $('batteryDisc').textContent=battOk?'✓':'!'; $('batteryDisc').style.background=battOk?'var(--green)':'var(--amber)'; $('batteryNote').textContent='Stato BMW'+(d.battery12v.bmwTimestamp?' · '+ageLabel(d.battery12v.bmwTimestamp):'');
   (() => {
     const hMap = {'200':'Buono ✅','0':'Scarica ⚠️','100':'Ricarica necessaria ⚠️'};
     const label = hMap[String(d.battery12v.rawHealthState)] || ('Codice: ' + (d.battery12v.rawHealthState || '—'));
@@ -2421,6 +2489,22 @@ function renderDashboard(d){
   })()
 
   renderQuickStats(d);
+  if(d.lastMovement){
+    $('lastMoveDistance').textContent='+'+fmt1(d.lastMovement.distanceKm)+' km';
+    $('lastMoveNote').textContent=formatTimestamp(d.lastMovement.timestamp)+' · '+(d.lastMovement.source||'odometro');
+  }else{
+    $('lastMoveDistance').textContent='—';
+    $('lastMoveNote').textContent='Nessun incremento odometro ricostruibile';
+  }
+  if(d.milestone81000){
+    $('milestoneRemaining').textContent=d.milestone81000.remainingKm>0?d.milestone81000.remainingKm.toLocaleString('it-IT')+' km':'Raggiunti';
+    if(d.milestone81000.estimatedDate && d.milestone81000.remainingKm>0){
+      var md=new Date(d.milestone81000.estimatedDate);
+      $('milestoneNote').textContent='~'+md.toLocaleDateString('it-IT',{day:'2-digit',month:'short'})+(d.milestone81000.avgKmPerDay?' · '+fmt1(d.milestone81000.avgKmPerDay)+' km/giorno':'');
+    }else{
+      $('milestoneNote').textContent=d.milestone81000.avgKmPerDay?fmt1(d.milestone81000.avgKmPerDay)+' km/giorno':'Serve più storico per stimare la data';
+    }
+  }
   // renderAnalytics(d.analytics); // replaced by getAnalytics
   // renderTrip(d.trip); // trip mode chart moved to analytics section
   renderTyres(d.tyres);
@@ -2429,7 +2513,7 @@ function renderDashboard(d){
   $('preconditionDetail').textContent=String(d.climate.errorReason||'').toLowerCase()==='ok'?'Nessun errore':(d.climate.errorReason?\`Stato: \${d.climate.errorReason}\`:'—');
   $('locationState').textContent=locationLabel(d.core.locationState);
   if(d.location && d.location.lat && d.location.lng) {
-    $('locationCoords').innerHTML='📍 '+d.location.lat.toFixed(4)+'°N, '+d.location.lng.toFixed(4)+'°E';
+    $('locationCoords').innerHTML='📍 '+d.location.lat.toFixed(4)+'°N, '+d.location.lng.toFixed(4)+'°E'+(d.location.timestamp?' · '+escapeHtml(ageLabel(d.location.timestamp)):'');
   } else {
     $('locationCoords').textContent='Solo zona, coordinate non disponibili';
   }
@@ -2447,7 +2531,7 @@ function renderDashboard(d){
     }
   }
   if (d.service.items && d.service.items.length > 0) {
-    $('serviceState').textContent = d.service.items.length + ' servizi monitorati';
+    $('serviceState').textContent = d.service.items.length + ' servizi monitorati' + (d.service.bmwTimestamp?' · '+ageLabel(d.service.bmwTimestamp):'');
     const statusIcons = { OK: '\u2705', OVERDUE: '\u26a0\ufe0f', UNKNOWN: '\u2753' };
     let tbl = '<table style="width:100%;border-collapse:collapse;font-size:0.88rem;margin-top:8px">';
     tbl += '<tr style="color:var(--muted);border-bottom:1px solid var(--line)"><th style="text-align:left;padding:6px 8px">Servizio</th><th style="text-align:center;padding:6px 4px">Stato</th><th style="text-align:center;padding:6px 4px">Scadenza</th><th style="text-align:center;padding:6px 4px">Km rimanenti</th></tr>';
@@ -2577,14 +2661,16 @@ function renderTrip(t){
 function renderTyres(t){
   const map={fl:'frontLeft',fr:'frontRight',rl:'rearLeft',rr:'rearRight',tfl:'targetFrontLeft',tfr:'targetFrontRight',trl:'targetRearLeft',trr:'targetRearRight'};
   Object.keys(map).forEach(id=>$(id).textContent=fmt1(t[map[id]]));
-  $('tyreTimestamp').textContent=\`BMW: \${dateTime(t.bmwTimestamp)}\`;
-  const defs=[['FL','frontLeft'],['FR','frontRight'],['RL','rearLeft'],['RR','rearRight']];
-  defs.forEach(([suffix,key])=>{
-    const alert=Boolean(t.alerts&&t.alerts[key]);
-    const box=$(\`tyre\${suffix}\`),badge=$(\`\${key==='frontLeft'?'fl':key==='frontRight'?'fr':key==='rearLeft'?'rl':'rr'}Alert\`);
-    box.classList.toggle('pressure-alert',alert); badge.classList.toggle('alert',alert); badge.textContent=alert?'CHECK':'OK';
+  $('tyreTimestamp').textContent=\`BMW: \${dateTime(t.bmwTimestamp)} · \${ageLabel(t.bmwTimestamp)}\`;
+  const defs=[['FL','frontLeft','fl'],['FR','frontRight','fr'],['RL','rearLeft','rl'],['RR','rearRight','rr']];
+  defs.forEach(([suffix,key,short])=>{
+    const targetAlert=Boolean(t.alerts&&t.alerts[key]); const trendAlert=Boolean(t.trendAlerts&&t.trendAlerts[key]); const alert=targetAlert||trendAlert;
+    const drift=t.trend&&t.trend[key]; if($(short+'Trend')) $(short+'Trend').textContent=drift===null||drift===undefined?'—':((drift>0?'+':'')+fmt1(drift)+' bar');
+    const box=$(\`tyre\${suffix}\`),badge=$(short+'Alert'); box.classList.toggle('pressure-alert',alert); badge.classList.toggle('alert',alert); badge.textContent=targetAlert?'TARGET':trendAlert?'Δ 0,2+':'OK';
   });
-  $('tyreAlertSummary').classList.toggle('hidden',!(t.alerts&&t.alerts.any));
+  const targetAny=Boolean(t.alerts&&t.alerts.any),trendAny=Boolean(t.trendAlerts&&t.trendAlerts.any);
+  $('tyreAlertSummary').classList.toggle('hidden',!(targetAny||trendAny));
+  $('tyreAlertSummary').textContent=targetAny?'⚠ Pressione fuori target di oltre 0,5 bar':trendAny?'⚠ Variazione di almeno 0,2 bar rispetto alla precedente rilevazione':'';
 }
 
 function buildBaseCharts(history,tyres){
