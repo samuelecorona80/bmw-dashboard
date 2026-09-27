@@ -63,6 +63,39 @@ function dateKeyInRome(value = new Date()) {
   return `${get('year')}-${get('month')}-${get('day')}`;
 }
 
+
+function haversineKm(aLat,aLng,bLat,bLng){
+  const R=6371, rad=x=>x*Math.PI/180;
+  const dLat=rad(bLat-aLat), dLng=rad(bLng-aLng);
+  const s=Math.sin(dLat/2)**2+Math.cos(rad(aLat))*Math.cos(rad(bLat))*Math.sin(dLng/2)**2;
+  return 2*R*Math.asin(Math.sqrt(s));
+}
+
+async function getLocalDieselPrice(location){
+  if(!location || !Number.isFinite(Number(location.lat)) || !Number.isFinite(Number(location.lng))) return null;
+  try{
+    const [stationsRes,updateRes]=await Promise.all([
+      fetch('https://carburanti.samuelecorona.it/data/stations.json',{cf:{cacheTtl:1800,cacheEverything:true}}),
+      fetch('https://carburanti.samuelecorona.it/data/last_update.json',{cf:{cacheTtl:1800,cacheEverything:true}})
+    ]);
+    if(!stationsRes.ok) return null;
+    const stations=await stationsRes.json(), candidates=[];
+    for(const s of stations){
+      const price=s?.prezzi?.Gasolio?.self;
+      if(!Number.isFinite(Number(price))||!Number.isFinite(Number(s.lat))||!Number.isFinite(Number(s.lng))) continue;
+      const km=haversineKm(Number(location.lat),Number(location.lng),Number(s.lat),Number(s.lng));
+      if(km<=12) candidates.push({price:Number(price),km});
+    }
+    if(!candidates.length) return null;
+    candidates.sort((a,b)=>a.km-b.km);
+    const prices=candidates.slice(0,12).map(x=>x.price).sort((a,b)=>a-b);
+    const mid=Math.floor(prices.length/2), median=prices.length%2?prices[mid]:(prices[mid-1]+prices[mid])/2;
+    let updatedAt=null;
+    if(updateRes.ok){try{const u=await updateRes.json();updatedAt=u.updated_at||u.timestamp||u.date||u.last_update||null}catch(_){}}
+    return {priceEur:Math.round(median*1000)/1000,updatedAt,stationCount:prices.length,radiusKm:12,source:'Carburanti Italia',cheapestEur:Math.round(Math.min(...prices)*1000)/1000};
+  }catch(_){return null}
+}
+
 // ─────────────────────────────────────────────
 // POST handler — receives snapshot data
 // ─────────────────────────────────────────────
@@ -426,6 +459,16 @@ async function handleGetData(env, cors) {
 
   // Analytics from history
   const analytics = computeDailyAnalytics(history);
+  const refuels=[];
+  for(let i=1;i<history.length;i++){
+    const prev=history[i-1],curr=history[i],a=resolveFuelLitres(prev),b=resolveFuelLitres(curr);
+    if(a===null||b===null) continue;
+    const added=b-a;
+    if(added>=8) refuels.push({timestamp:curr.timestamp,litresEstimated:Math.round(added*10)/10,odometerKm:curr.mileageKm});
+  }
+  const consumptionPoints=(analytics.consumption&&analytics.consumption.points)||[];
+  const consumptionCoveredKm=consumptionPoints.reduce((s,p)=>s+(Number(p.deltaKm)||0),0);
+  const consumptionConfidence=consumptionPoints.length>=8&&consumptionCoveredKm>=500?'alta':(consumptionPoints.length>=4&&consumptionCoveredKm>=200?'media':'bassa');
   const locationState = state('device_tracker.x3_m40d');
   const normalizeLocation = v => { if(!v) return 'Stato sconosciuto'; return String(v).toLowerCase()==='home'?'Home':String(v); };
 
@@ -464,13 +507,42 @@ async function handleGetData(env, cors) {
     }
   } catch(_) { distanceThisMonth = toNum(state('sensor.x3_m40d_driving_distance_this_month')); }
 
-  // Get latest diesel price from D1
+  // Get latest diesel price from D1, then prefer local Gasolio Self from Carburanti Italia.
   let dieselPriceEur = DIESEL_PRICE_EUR;
   let dieselPriceDate = DIESEL_PRICE_DATE;
+  let dieselPriceSource = 'Fallback';
+  let dieselPriceMeta = null;
   try {
     const priceRow = await db.prepare('SELECT date, price_eur FROM diesel_prices ORDER BY date DESC LIMIT 1').first();
-    if (priceRow) { dieselPriceEur = priceRow.price_eur; dieselPriceDate = priceRow.date; }
+    if (priceRow) { dieselPriceEur = priceRow.price_eur; dieselPriceDate = priceRow.date; dieselPriceSource='D1'; }
   } catch(_) {}
+  const localDiesel=await getLocalDieselPrice(locationCoords);
+  if(localDiesel){
+    dieselPriceEur=localDiesel.priceEur;
+    dieselPriceDate=localDiesel.updatedAt||dateKeyInRome(new Date());
+    dieselPriceSource=localDiesel.source;
+    dieselPriceMeta=localDiesel;
+  }
+
+  const freshClass=(v,greenH,amberH)=>{
+    if(!v)return 'unknown'; const d=new Date(v); if(Number.isNaN(d.getTime()))return 'unknown';
+    const h=Math.max(0,(Date.now()-d.getTime())/3600000);
+    return h<=greenH?'fresh':(h<=amberH?'stale':'old');
+  };
+  const freshness={
+    odometer:{timestamp:currentMileageChangedAt||null,status:freshClass(currentMileageChangedAt,6,24)},
+    fuel:{timestamp:ts('sensor.x3_m40d_range_tank_level')||ts('sensor.x3_m40d_range_total_range_last_sent'),status:freshClass(ts('sensor.x3_m40d_range_tank_level')||ts('sensor.x3_m40d_range_total_range_last_sent'),6,48)},
+    tyres:{timestamp:tyres.bmwTimestamp,status:freshClass(tyres.bmwTimestamp,24,96)},
+    battery:{timestamp:ts('sensor.wbatx91030lp62133_battery_recharge_required'),status:freshClass(ts('sensor.wbatx91030lp62133_battery_recharge_required'),24,72)},
+    location:{timestamp:locationTimestamp,status:freshClass(locationTimestamp,6,48)}
+  };
+  const anomalies=[];
+  if(freshness.odometer.status==='old') anomalies.push({severity:'warn',text:'Odometro non aggiornato da oltre 24 ore'});
+  if(freshness.battery.status==='old') anomalies.push({severity:'warn',text:'Stato batteria 12V molto vecchio'});
+  if(tyres.trendAlerts?.any) anomalies.push({severity:'warn',text:'Variazione pressione ≥0,2 bar rilevata'});
+  if(tyres.alerts?.any) anomalies.push({severity:'alert',text:'Pressione pneumatici fuori target'});
+  if(String(state('sensor.x3_m40d_doors_overall_state')||'').toUpperCase()==='UNLOCKED') anomalies.push({severity:'alert',text:'Vettura sbloccata'});
+  if(!anomalies.length) anomalies.push({severity:'ok',text:'Nessuna anomalia recente rilevata'});
 
   const payload = {
     generatedAt: new Date().toISOString(),
@@ -550,12 +622,18 @@ async function handleGetData(env, cors) {
     location: locationCoords ? { ...locationCoords, timestamp: locationTimestamp } : null,
     lastMovement,
     milestone81000,
+    refuels:{count:refuels.length,last:refuels.length?refuels[refuels.length-1]:null,recent:refuels.slice(-5).reverse()},
+    freshness,
+    anomalies,
+    consumptionQuality:{confidence:consumptionConfidence,coveredKm:Math.round(consumptionCoveredKm),samples:consumptionPoints.length},
     distanceThisMonth,
     distanceThisMonthPartial: Boolean(currentMileageChangedAt && dateKeyInRome(currentMileageChangedAt) < todayRome),
     distanceThisMonthThrough: currentMileageChangedAt || null,
     costs: {
       dieselPriceEur: dieselPriceEur,
       dieselPriceDate: dieselPriceDate,
+      dieselPriceSource,
+      dieselPriceMeta,
       costPerKm: analytics.consumption.average ? (analytics.consumption.average / 100 * dieselPriceEur) : null,
       costThisMonth: distanceThisMonth && analytics.consumption.average ? Math.round(distanceThisMonth * analytics.consumption.average / 100 * dieselPriceEur) : null
     },
@@ -2211,6 +2289,8 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     <section class="insight-grid">
       <article class="card insight-card"><div class="card-kicker">Ultimo movimento</div><strong id="lastMoveDistance">—</strong><div class="mini-note" id="lastMoveNote">In attesa di dati odometro</div></article>
       <article class="card insight-card"><div class="card-kicker">Verso 81.000 km</div><strong id="milestoneRemaining">—</strong><div class="mini-note" id="milestoneNote">Stima in preparazione</div></article>
+      <article class="card insight-card"><div class="card-kicker">Anomalie recenti</div><div id="anomalyList" class="mini-note">Analisi in corso…</div></article>
+      <article class="card insight-card"><div class="card-kicker">Ultimo rifornimento rilevato</div><strong id="lastRefuel">—</strong><div class="mini-note" id="lastRefuelNote">Stima da livello serbatoio</div></article>
     </section>
 
     <section class="summary-grid">
@@ -2269,7 +2349,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 
     <section class="lower-grid">
       <article class="card tyres-card" style="padding:24px">
-        <div class="section-head"><div><div class="card-kicker">Pneumatici</div><div class="mini-note">Pneumatici nuovi da ~1 settimana, ant. ~500 km, post. ~200 km</div></div><div class="tiny-time" id="tyreTimestamp">—</div></div>
+        <div class="section-head"><div><div class="card-kicker">Pneumatici</div><div class="mini-note">Trend rispetto alla precedente rilevazione valida</div></div><div class="tiny-time" id="tyreTimestamp">—</div></div>
         <div class="tyre-alert-summary hidden" id="tyreAlertSummary">⚠ Pressione fuori target di oltre 0,5 bar</div>
         <div class="tyres-layout">
           <div class="tyre-metric fl" id="tyreFL"><span>Ant. sinistra</span><strong><span id="fl">—</span> bar</strong><small>Target <span id="tfl">—</span> · Δ <span id="flTrend">—</span></small><b class="pressure-badge" id="flAlert">OK</b></div>
@@ -2535,9 +2615,22 @@ function renderDashboard(d){
     $('milestoneRemaining').textContent=d.milestone81000.remainingKm>0?d.milestone81000.remainingKm.toLocaleString('it-IT')+' km':'Raggiunti';
     if(d.milestone81000.estimatedDate && d.milestone81000.remainingKm>0){
       var md=new Date(d.milestone81000.estimatedDate);
-      $('milestoneNote').textContent='~'+md.toLocaleDateString('it-IT',{day:'2-digit',month:'short'})+(d.milestone81000.avgKmPerDay?' · '+fmt1(d.milestone81000.avgKmPerDay)+' km/giorno':'');
+      $('milestoneNote').textContent='~'+md.toLocaleDateString('it-IT',{day:'2-digit',month:'short'})+(d.milestone81000.avgKmPerDay?' · '+fmt1(d.milestone81000.avgKmPerDay)+' km/giorno':'')+(d.distanceThisMonthPartial?' · odometro parziale':'');
     }else{
       $('milestoneNote').textContent=d.milestone81000.avgKmPerDay?fmt1(d.milestone81000.avgKmPerDay)+' km/giorno':'Serve più storico per stimare la data';
+    }
+  }
+  if($('anomalyList')) $('anomalyList').innerHTML=(d.anomalies||[]).map(function(a){
+    var icon=a.severity==='ok'?'✓':(a.severity==='alert'?'!':'⚠');
+    return '<div class="'+(a.severity==='alert'?'error':(a.severity==='warn'?'warn':''))+'" style="margin:4px 0">'+icon+' '+escapeHtml(a.text)+'</div>';
+  }).join('');
+  if($('lastRefuel')){
+    if(d.refuels&&d.refuels.last){
+      $('lastRefuel').textContent='~'+fmt1(d.refuels.last.litresEstimated)+' L';
+      $('lastRefuelNote').textContent=formatTimestamp(d.refuels.last.timestamp)+(d.refuels.last.odometerKm?' · '+fmtInt(d.refuels.last.odometerKm)+' km':'')+' · stima';
+    }else{
+      $('lastRefuel').textContent='—';
+      $('lastRefuelNote').textContent='Nessun aumento ≥8 L rilevato';
     }
   }
   // renderAnalytics(d.analytics); // replaced by getAnalytics
@@ -2647,15 +2740,14 @@ function renderQuickStats(d){
   }
   $('quickConsumption').textContent=d.quick.consumptionL100===null?'—':fmt1(d.quick.consumptionL100);
   if (d.analytics && d.analytics.consumption && d.analytics.consumption.points && d.analytics.consumption.points.length > 0) {
-    const lastPt = d.analytics.consumption.points[d.analytics.consumption.points.length-1];
-    const avgC = d.analytics.consumption.average;
-    $('quickConsumptionNote').textContent = avgC ? 'media periodo: ' + avgC.toFixed(1) + ' L/100km' : 'ultimo intervallo';
+    const avgC = d.analytics.consumption.average, q=d.consumptionQuality||{};
+    $('quickConsumptionNote').textContent = avgC ? 'stima · affidabilità '+(q.confidence||'bassa')+' · '+(q.coveredKm||0)+' km coperti' : 'stima ultimo intervallo';
   }
   $('quickEco').textContent=\`\${fmtInt(d.quick.ecoProPercent)}%\`;
   $('quickStatus').textContent=d.quick.vehicleState||'—';
   if(d.costs && d.costs.costPerKm) {
     $('quickCostKm').textContent=d.costs.costPerKm.toFixed(3)+' \u20ac';
-    $('quickCostNote').textContent='diesel '+d.costs.dieselPriceEur.toFixed(3)+' \u20ac/L';
+    $('quickCostNote').textContent='diesel '+d.costs.dieselPriceEur.toFixed(3)+' \u20ac/L · '+(d.costs.dieselPriceSource||'fonte n.d.');
   }
   if(d.costs && d.costs.costThisMonth) {
     $('heroCostMonth').textContent=(d.distanceThisMonthPartial?'≥ ':'~')+d.costs.costThisMonth+' \u20ac questo mese';
