@@ -348,6 +348,19 @@ async function handleGetData(env, cors) {
   const kpaToBar = v => { const n=toNum(v); return n===null?null:Math.round(n/100*10)/10; };
   const isOff = id => String(state(id)).toLowerCase()==='off';
   const isClosed = id => String(state(id)).toLowerCase()==='closed';
+  const validState = v => v!==null && v!==undefined && v!=='' && !['unknown','unavailable','none','null'].includes(String(v).toLowerCase());
+  const triAllOff = ids => {
+    const vals=ids.map(id=>state(id));
+    if(!vals.some(validState)) return null;
+    if(vals.some(v=>validState(v) && String(v).toLowerCase()!=='off')) return false;
+    return vals.filter(validState).every(v=>String(v).toLowerCase()==='off');
+  };
+  const triAllClosed = ids => {
+    const vals=ids.map(id=>state(id));
+    if(!vals.some(validState)) return null;
+    if(vals.some(v=>validState(v) && String(v).toLowerCase()!=='closed')) return false;
+    return vals.filter(validState).every(v=>String(v).toLowerCase()==='closed');
+  };
   const round_ = (v,d) => { const p=Math.pow(10,d||0); return Math.round((v+Number.EPSILON)*p)/p; };
 
   const mileageId = 'sensor.x3_m40d_vehicle_mileage';
@@ -407,7 +420,8 @@ async function handleGetData(env, cors) {
   const ecoProPlus = clamp(state('sensor.x3_m40d_trip_eco_pro_plus_share'));
   const electric = clamp(state('sensor.x3_m40d_trip_electric_share'));
   const normal = Math.max(0, round_(100-ecoPro-ecoProPlus-electric, 1));
-  const tripInProgress = !isOff('binary_sensor.x3_m40d_trip_in_progress');
+  const tripRaw = state('binary_sensor.x3_m40d_trip_in_progress');
+  const tripInProgress = validState(tripRaw) ? String(tripRaw).toLowerCase()!=='off' : null;
   const trip = { ecoPro, ecoProPlus, electric, normal, inProgress: tripInProgress, totalReported: round_(ecoPro+ecoProPlus+electric,1) };
 
   // Analytics from history
@@ -477,11 +491,11 @@ async function handleGetData(env, cors) {
     tyres,
     security: {
       lockState: state('sensor.x3_m40d_doors_overall_state') || state('sensor.wbatx91030lp62133_doors_lock'),
-      doorsClosed: isOff('binary_sensor.x3_m40d_door_state_front_driver') && isOff('binary_sensor.x3_m40d_door_state_front_passenger') && isOff('binary_sensor.x3_m40d_door_state_rear_driver') && isOff('binary_sensor.x3_m40d_door_state_rear_passenger'),
-      windowsClosed: isClosed('sensor.x3_m40d_window_state_front_driver') && isClosed('sensor.x3_m40d_window_state_front_passenger') && isClosed('sensor.x3_m40d_window_state_rear_driver') && isClosed('sensor.x3_m40d_window_state_rear_passenger'),
-      hoodClosed: isOff('binary_sensor.x3_m40d_hood_state'),
-      tailgateClosed: isOff('binary_sensor.x3_m40d_tailgate_state') && isOff('binary_sensor.x3_m40d_tailgate_door_state'),
-      sunroofClosed: isClosed('sensor.x3_m40d_sunroof_overall_state') || isClosed('sensor.x3_m40d_sunroof_state'),
+      doorsClosed: triAllOff(['binary_sensor.x3_m40d_door_state_front_driver','binary_sensor.x3_m40d_door_state_front_passenger','binary_sensor.x3_m40d_door_state_rear_driver','binary_sensor.x3_m40d_door_state_rear_passenger']),
+      windowsClosed: triAllClosed(['sensor.x3_m40d_window_state_front_driver','sensor.x3_m40d_window_state_front_passenger','sensor.x3_m40d_window_state_rear_driver','sensor.x3_m40d_window_state_rear_passenger']),
+      hoodClosed: triAllOff(['binary_sensor.x3_m40d_hood_state']),
+      tailgateClosed: triAllOff(['binary_sensor.x3_m40d_tailgate_state','binary_sensor.x3_m40d_tailgate_door_state']),
+      sunroofClosed: triAllClosed(['sensor.x3_m40d_sunroof_overall_state','sensor.x3_m40d_sunroof_state']),
       tripInProgress,
       lockTimestamp: ts('sensor.x3_m40d_doors_overall_state') || ts('sensor.wbatx91030lp62133_doors_lock') || ts('vehicle.cabin.door.status'),
       doorsTimestamp: ts('binary_sensor.x3_m40d_door_state_front_driver') || ts('vehicle.cabin.door.row1.driver.isOpen'),
@@ -531,12 +545,14 @@ async function handleGetData(env, cors) {
       dailyKmBaseline: beforeTodayEvent ? beforeTodayEvent.km : null,
       consumptionL100: analytics.consumption.latest,
       ecoProPercent: ecoPro,
-      vehicleState: tripInProgress ? 'In viaggio' : normalizeLocation(locationState)
+      vehicleState: tripInProgress===true ? 'In viaggio' : (tripInProgress===null ? 'Stato viaggio n.d.' : normalizeLocation(locationState))
     },
     location: locationCoords ? { ...locationCoords, timestamp: locationTimestamp } : null,
     lastMovement,
     milestone81000,
     distanceThisMonth,
+    distanceThisMonthPartial: Boolean(currentMileageChangedAt && dateKeyInRome(currentMileageChangedAt) < todayRome),
+    distanceThisMonthThrough: currentMileageChangedAt || null,
     costs: {
       dieselPriceEur: dieselPriceEur,
       dieselPriceDate: dieselPriceDate,
@@ -2052,11 +2068,11 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 @media(max-width:1050px){.advanced-grid{grid-template-columns:1fr 1fr}.trip-card{grid-column:1/-1}.trip-layout{grid-template-columns:170px 1fr;max-width:520px;margin:auto}}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
 @media(max-width:900px){.shell{width:min(100% - 18px,760px);padding-top:12px}.topbar{align-items:flex-start}.brand-title{font-size:22px}.roundel{width:45px;height:45px}.hero-grid,.lower-grid,.charts-grid{grid-template-columns:1fr}.hero-card{min-height:420px;padding:26px}.hero-copy h1{font-size:45px}.car-side{width:92%;right:-16%;opacity:.65}.quick-stats{grid-template-columns:1fr 1fr}.summary-grid{grid-template-columns:1fr 1fr}.security-card{grid-column:1/-1}.advanced-grid{grid-template-columns:1fr}.trip-card{grid-column:auto}.tyres-layout{grid-template-columns:1fr 150px 1fr;height:340px}.top-car{width:115px;height:285px}.check-list{grid-template-columns:1fr}.charts-grid{grid-template-columns:1fr}.footer{grid-template-columns:1fr;gap:15px}.footer div{border-right:0;border-bottom:1px solid #20394f;padding:0 8px 15px}.footer div:last-child{border-bottom:0}.top-status .eyebrow,.top-status .time{display:none}}
-@media(max-width:560px){.summary-grid{grid-template-columns:1fr}.quick-stats{grid-template-columns:repeat(2,minmax(0,1fr))}.quick-card:last-child{grid-column:1/-1}.insight-grid{grid-template-columns:1fr 1fr}.insight-card{padding:14px}.insight-card strong{font-size:20px}.security-card{grid-column:auto}.hero-card{min-height:380px}.hero-copy h1{font-size:39px}.car-side{bottom:10px;right:-27%;width:118%}.quick-card{min-height:82px}.tyres-layout{grid-template-columns:1fr 105px 1fr;gap:6px;height:310px}.top-car{width:82px;height:240px}.car-roof{left:14px;right:14px}.tyre-metric{padding:6px}.tyre-metric strong{font-size:24px}.tyre-metric span{font-size:11px}.trip-layout{grid-template-columns:1fr;height:auto}.donut-wrap{margin:4px auto 16px}.footer{padding-top:18px}}
+@media(max-width:560px){.summary-grid{grid-template-columns:1fr}.quick-stats{grid-template-columns:repeat(2,minmax(0,1fr))}.quick-card:last-child{grid-column:1/-1}.insight-grid{grid-template-columns:1fr 1fr}.insight-card{padding:14px}.insight-card strong{font-size:20px}.security-card{grid-column:auto}.period-bar{position:static;padding:.65rem .4rem}.period-pill{padding:.4rem .75rem}.period-label{order:3;width:100%;margin-left:0}.period-bar>div{order:4;width:100%;margin-left:0!important}.hero-card{min-height:380px}.hero-copy h1{font-size:39px}.car-side{bottom:10px;right:-27%;width:118%}.quick-card{min-height:82px}.tyres-layout{grid-template-columns:1fr 105px 1fr;gap:6px;height:310px}.top-car{width:82px;height:240px}.car-roof{left:14px;right:14px}.tyre-metric{padding:6px}.tyre-metric strong{font-size:24px}.tyre-metric span{font-size:11px}.trip-layout{grid-template-columns:1fr;height:auto}.donut-wrap{margin:4px auto 16px}.footer{padding-top:18px}}
 
 
 /* Period selector */
-.period-bar{display:flex;align-items:center;gap:.5rem;padding:.75rem 1rem;position:sticky;top:0;z-index:10;background:var(--bg);border-bottom:1px solid var(--line)}
+.period-bar{display:flex;align-items:center;gap:.5rem;padding:.75rem 1rem;position:sticky;top:0;z-index:10;background:var(--bg);border-bottom:1px solid var(--line);flex-wrap:wrap}
 .period-pill{background:var(--card);color:var(--muted);border:1px solid var(--line);border-radius:2rem;padding:.4rem 1rem;font-size:.82rem;font-weight:600;cursor:pointer;transition:all .2s}
 .period-pill.active{background:var(--blue);color:#fff;border-color:var(--blue)}
 .period-pill:hover:not(.active){border-color:var(--blue);color:var(--text)}
@@ -2186,7 +2202,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 
     <section class="quick-stats" aria-label="Riepilogo rapido">
       <article class="quick-card"><span class="quick-icon">🛣️</span><div><small>Km oggi</small><strong id="quickKm">—</strong><em id="quickKmNote">ultimo intervallo giornaliero</em></div></article>
-      <article class="quick-card"><span class="quick-icon">⛽</span><div><small>Consumo</small><strong id="quickConsumption">—</strong><em id="quickConsumptionNote">L/100km stimati</em></div></article>
+      <article class="quick-card"><span class="quick-icon">⛽</span><div><small>Consumo stimato</small><strong id="quickConsumption">—</strong><em id="quickConsumptionNote">L/100km stimati</em></div></article>
       <article class="quick-card"><span class="quick-icon">🌿</span><div><small>ECO Pro</small><strong id="quickEco">—</strong><em>ultimo trip BMW</em></div></article>
       <article class="quick-card"><span class="quick-icon">💰</span><div><small>Costo/km</small><strong id="quickCostKm">—</strong><em id="quickCostNote">€ al km stimato</em></div></article>
       <article class="quick-card"><span class="quick-icon">🅿️</span><div><small>Stato</small><strong id="quickStatus">—</strong><em id="quickStatusNote">stato corrente</em></div></article>
@@ -2235,25 +2251,20 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
        <div style="display:flex;gap:6px;align-items:center;margin-left:auto;flex-wrap:wrap">
          <select id="periodMonth" style="background:var(--card);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:5px 8px;font-size:0.8rem;cursor:pointer" onchange="selectMonthYear()">
            <option value="">Mese</option>
-           <option value="01">Gennaio</option><option value="02">Febbraio</option><option value="03">Marzo</option>
-           <option value="04">Aprile</option><option value="05">Maggio</option><option value="06">Giugno</option>
-           <option value="07">Luglio</option><option value="08">Agosto</option><option value="09" selected>Settembre</option>
-           <option value="10">Ottobre</option><option value="11">Novembre</option><option value="12">Dicembre</option>
          </select>
          <select id="periodYear" style="background:var(--card);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:5px 8px;font-size:0.8rem;cursor:pointer" onchange="selectMonthYear()">
            <option value="">Anno</option>
-           <option value="2025">2025</option><option value="2026" selected>2026</option><option value="2027">2027</option>
          </select>
        </div>
     </div>
     <div class="analytics-spinner hidden" id="analyticsLoading"><div class="spinner small"></div></div>
 
     <section class="analytics-grid" id="drivingSection">
-      <article class="card compact-card"><div class="card-kicker">Distance</div><div class="big-metric"><span id="distanceKm">—</span><small> km</small></div><div class="metric-row-compact"><div><span class="metric-label">km/day</span><strong id="avgKmDay">—</strong></div><div><span class="metric-label" id="activeLabel">km/active day</span><strong id="avgKmActive">—</strong></div></div><div class="metric-row-compact"><div><span class="metric-label">Driving days</span><strong id="drivingDaysVal">—</strong></div><div><span class="metric-label">Longest</span><strong id="longestDayVal">—</strong></div></div><div class="partial-badge hidden" id="drivingDaysCov">Partial coverage</div></article>
-      <article class="card compact-card"><div class="card-kicker">Fuel Economy</div><div class="big-metric"><span id="fuelKmL">—</span><small> km/l</small> <span class="badge hidden" id="fuelBadge"></span></div><div class="mini-note hidden" id="fuelCoverage"></div></article>
-      <article class="card chart-card"><div class="card-kicker">Daily Distance</div><div class="chart-holder"><canvas id="dailyKmChart2"></canvas><div class="empty-state hidden" id="dailyKmEmpty2">Waiting for data</div></div></article>
-      <article class="card compact-card"><div class="card-kicker">Trips</div><div id="tripStatsContent"><div class="trip-collecting"><span class="pulse-dot"></span> Trip tracking collecting data</div></div></article>
-      <article class="card compact-card coverage-card"><div class="card-kicker">Mileage Coverage</div><div class="coverage-line"><span id="covFirst">—</span> → <span id="covLast">—</span> km</div><div class="coverage-dist"><span id="covDist">—</span> km tracked</div><div class="mini-note hidden" id="covGap"></div></article>
+      <article class="card compact-card"><div class="card-kicker">Distanza</div><div class="big-metric"><span id="distanceKm">—</span><small> km</small></div><div class="metric-row-compact"><div><span class="metric-label">km/giorno</span><strong id="avgKmDay">—</strong></div><div><span class="metric-label" id="activeLabel">km/giorno attivo</span><strong id="avgKmActive">—</strong></div></div><div class="metric-row-compact"><div><span class="metric-label">Giorni guidati</span><strong id="drivingDaysVal">—</strong></div><div><span class="metric-label">Più lungo</span><strong id="longestDayVal">—</strong></div></div><div class="partial-badge hidden" id="drivingDaysCov">Partial coverage</div></article>
+      <article class="card compact-card"><div class="card-kicker">Consumo carburante</div><div class="big-metric"><span id="fuelKmL">—</span><small> km/l</small> <span class="badge hidden" id="fuelBadge"></span></div><div class="mini-note hidden" id="fuelCoverage"></div></article>
+      <article class="card chart-card"><div class="card-kicker">Distanza giornaliera</div><div class="chart-holder"><canvas id="dailyKmChart2"></canvas><div class="empty-state hidden" id="dailyKmEmpty2">Waiting for data</div></div></article>
+      <article class="card compact-card"><div class="card-kicker">Viaggi</div><div id="tripStatsContent"><div class="trip-collecting"><span class="pulse-dot"></span> Trip tracking collecting data</div></div></article>
+      <article class="card compact-card coverage-card"><div class="card-kicker">Copertura chilometraggio</div><div class="coverage-line"><span id="covFirst">—</span> → <span id="covLast">—</span> km</div><div class="coverage-dist"><span id="covDist">—</span> km tracked</div><div class="mini-note hidden" id="covGap"></div></article>
     </section>
 
     <section class="lower-grid">
@@ -2368,6 +2379,17 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 let charts = {};
 const $ = id => document.getElementById(id);
 
+function initPeriodSelectors(){
+  var m=$('periodMonth'), y=$('periodYear');
+  if(!m||!y)return;
+  var names=['Gennaio','Febbraio','Marzo','Aprile','Maggio','Giugno','Luglio','Agosto','Settembre','Ottobre','Novembre','Dicembre'];
+  names.forEach((name,i)=>{var o=document.createElement('option');o.value=String(i+1).padStart(2,'0');o.textContent=name;m.appendChild(o)});
+  var now=new Date(), cy=now.getFullYear();
+  for(var yr=cy-2;yr<=cy+1;yr++){var o=document.createElement('option');o.value=String(yr);o.textContent=String(yr);y.appendChild(o)}
+  m.value=String(now.getMonth()+1).padStart(2,'0');
+  y.value=String(cy);
+}
+
 function fmtInt(v){
   if(v === null || v === undefined || v === '') return '—';
   return Number(v).toLocaleString('it-IT',{maximumFractionDigits:0});
@@ -2398,7 +2420,7 @@ function formatTimestamp(ts) {
 }
 
 function shortDate(v){ const d=parseDate(v); return d?d.toLocaleDateString('it-IT',{day:'2-digit',month:'2-digit'}):String(v||''); }
-function boolIcon(id,ok){ const el=$(id); if(!el)return; el.textContent=ok?'✓':'!'; el.parentElement.classList.toggle('error',!ok); }
+function boolIcon(id,ok){ const el=$(id); if(!el)return; if(ok===null||ok===undefined){el.textContent='?';el.parentElement.classList.remove('error');el.parentElement.classList.add('warn');return;} el.textContent=ok?'✓':'!'; el.parentElement.classList.toggle('error',!ok); el.parentElement.classList.remove('warn'); }
 function lockLabel(v){ const x=String(v||'').toLowerCase(); if(['secured','locked','selectivelocked','selective-locked'].includes(x))return '🔒 Bloccata'; if(x==='unlocked')return '🔓 Sbloccata'; return v||'—'; }
 function locationLabel(v){ const x=String(v||'').toLowerCase(); if(x==='home')return '🏠 Casa'; if(x==='not_home'||x==='away')return '📍 Fuori casa'; return v||'Sconosciuto'; }
 function climateLabel(v){ const labels={'INACTIVE':'Inattivo','ACTIVE':'Attivo','HEATING':'Riscaldamento','COOLING':'Raffreddamento','VENTILATION':'Ventilazione','OFF':'Spento'}; return labels[String(v||'')] || v || '—'; }
@@ -2432,22 +2454,24 @@ function renderDashboard(d){
   $('homePill').textContent=\`● \${locationLabel(d.core.locationState)}\`;
   // Status banner rendering
   var lkV = (d.security.lockState || '').toUpperCase();
+  var lockKnown = ['LOCKED','SECURED','UNLOCKED'].includes(lkV);
   var isLk = lkV === 'LOCKED' || lkV === 'SECURED';
-  if($('statusBannerIcon')) $('statusBannerIcon').textContent = isLk ? '🔒' : '🔓';
-  if($('statusBannerLock')) { $('statusBannerLock').textContent = isLk ? 'Bloccata' : 'Sbloccata'; $('statusBannerLock').style.color = isLk ? '#5cf29c' : '#ff5757'; }
+  if($('statusBannerIcon')) $('statusBannerIcon').textContent = !lockKnown ? '❔' : (isLk ? '🔒' : '🔓');
+  if($('statusBannerLock')) { $('statusBannerLock').textContent = !lockKnown ? 'Stato serratura n.d.' : (isLk ? 'Bloccata' : 'Sbloccata'); $('statusBannerLock').style.color = !lockKnown ? '#f2b84b' : (isLk ? '#5cf29c' : '#ff5757'); }
   if($('statusBannerTime')) $('statusBannerTime').textContent = d.security.lockTimestamp ? formatTimestamp(d.security.lockTimestamp) : '';
-  var oM='<b style="color:#5cf29c">✓</b> ', wM='<b style="color:#ff5757">✗</b> ';
-  if($('sBDoors')) $('sBDoors').innerHTML = (d.security.doorsClosed?oM:wM)+'Porte';
-  if($('sBWindows')) $('sBWindows').innerHTML = (d.security.windowsClosed?oM:wM)+'Finestrini';
-  if($('sBHood')) $('sBHood').innerHTML = (d.security.hoodClosed?oM:wM)+'Cofano';
-  if($('sBTrunk')) $('sBTrunk').innerHTML = (d.security.tailgateClosed?oM:wM)+'Portellone';
-  if($('sBSunroof')) $('sBSunroof').innerHTML = (d.security.sunroofClosed?oM:wM)+'Tetto';
-  if($('heroLock')) { $('heroLock').style.background=isLk?'rgba(46,165,92,.2)':'rgba(255,87,87,.2)'; $('heroLock').style.color=isLk?'#5cf29c':'#ff5757'; $('heroLock').innerHTML=(isLk?'🔒':'🔓')+' <strong>'+(isLk?'Bloccata':'Sbloccata')+'</strong>'; }
+  var oM='<b style="color:#5cf29c">✓</b> ', wM='<b style="color:#ff5757">✗</b> ', uM='<b style="color:#f2b84b">?</b> ';
+  var mark=v=>v===null||v===undefined?uM:(v?oM:wM);
+  if($('sBDoors')) $('sBDoors').innerHTML = mark(d.security.doorsClosed)+'Porte';
+  if($('sBWindows')) $('sBWindows').innerHTML = mark(d.security.windowsClosed)+'Finestrini';
+  if($('sBHood')) $('sBHood').innerHTML = mark(d.security.hoodClosed)+'Cofano';
+  if($('sBTrunk')) $('sBTrunk').innerHTML = mark(d.security.tailgateClosed)+'Portellone';
+  if($('sBSunroof')) $('sBSunroof').innerHTML = mark(d.security.sunroofClosed)+'Tetto';
+  if($('heroLock')) { $('heroLock').style.background=!lockKnown?'rgba(242,184,75,.16)':(isLk?'rgba(46,165,92,.2)':'rgba(255,87,87,.2)'); $('heroLock').style.color=!lockKnown?'#f2b84b':(isLk?'#5cf29c':'#ff5757'); $('heroLock').innerHTML=(!lockKnown?'❔':(isLk?'🔒':'🔓'))+' <strong>'+(!lockKnown?'Serratura n.d.':(isLk?'Bloccata':'Sbloccata'))+'</strong>'; }
 
   // Hero stats
   if(d.core.mileageKm) $('heroKm').textContent=fmtInt(d.core.mileageKm);
   if(d.core.fuelPercent!=null) $('heroFuel').textContent=fmtInt(d.core.fuelPercent)+'% ('+( d.core.fuelLitres||'—')+'L) · '+(d.core.rangeKm||'—')+' km';
-  if(d.distanceThisMonth!=null) $('heroMonthKm').textContent=fmtInt(d.distanceThisMonth);
+  if(d.distanceThisMonth!=null) $('heroMonthKm').textContent=(d.distanceThisMonthPartial?'≥ ':'')+fmtInt(d.distanceThisMonth);
   var lastTs = d.core.lastBmwTimestamp || d.core.lastHaUpdated;
   if(lastTs) { try { var dt=new Date(lastTs); $('heroLastUpdate').textContent=dt.toLocaleDateString('it-IT',{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'}); } catch(e2){} }
   // Trip badge
@@ -2483,8 +2507,8 @@ function renderDashboard(d){
   if(d.security.tailgateTimestamp) $('tailgateTs').textContent=formatTimestamp(d.security.tailgateTimestamp);
   if(d.security.sunroofTimestamp) $('sunroofTs').textContent=formatTimestamp(d.security.sunroofTimestamp);
   boolIcon('doorsIcon',d.security.doorsClosed); boolIcon('windowsIcon',d.security.windowsClosed);
-  $('doorsLabel').textContent=d.security.doorsClosed?'Porte chiuse':'Porte aperte / da verificare';
-  $('windowsLabel').textContent=d.security.windowsClosed?'Finestrini chiusi':'Finestrini aperti / da verificare';
+  $('doorsLabel').textContent=d.security.doorsClosed===null?'Porte: dato n.d.':(d.security.doorsClosed?'Porte chiuse':'Porte aperte');
+  $('windowsLabel').textContent=d.security.windowsClosed===null?'Finestrini: dato n.d.':(d.security.windowsClosed?'Finestrini chiusi':'Finestrini aperti');
   boolIcon('hoodIcon',d.security.hoodClosed); boolIcon('tailgateIcon',d.security.tailgateClosed); boolIcon('sunroofIcon',d.security.sunroofClosed);
 
   const battOk=d.battery12v.rechargeRequired===0||d.battery12v.rechargeRequired===null;
@@ -2634,11 +2658,11 @@ function renderQuickStats(d){
     $('quickCostNote').textContent='diesel '+d.costs.dieselPriceEur.toFixed(3)+' \u20ac/L';
   }
   if(d.costs && d.costs.costThisMonth) {
-    $('heroCostMonth').textContent='~'+d.costs.costThisMonth+' \u20ac questo mese';
+    $('heroCostMonth').textContent=(d.distanceThisMonthPartial?'≥ ':'~')+d.costs.costThisMonth+' \u20ac questo mese';
   } else {
     $('heroCostMonth').textContent='';
   }
-  $('quickStatusNote').textContent=d.trip.inProgress?'trip BMW in corso':'stato corrente';
+  $('quickStatusNote').textContent=d.trip.inProgress===null?'dato viaggio non disponibile':(d.trip.inProgress?'trip BMW in corso':'stato corrente');
 }
 
 function renderAnalytics(a){
@@ -2660,7 +2684,7 @@ function renderAnalytics(a){
 }
 
 function renderTrip(t){
-  $('tripState').textContent=t.inProgress?'In corso':'Fermo';
+  $('tripState').textContent=t.inProgress===null?'Dato n.d.':(t.inProgress?'In corso':'Fermo');
   $('ecoProValue').textContent=\`\${fmtInt(t.ecoPro)}%\`; $('ecoProPlusValue').textContent=\`\${fmtInt(t.ecoProPlus)}%\`;
   $('electricValue').textContent=\`\${fmtInt(t.electric)}%\`; $('normalValue').textContent=\`\${fmt1(t.normal)}%\`;
   makeChart('tripModeChart','doughnut',[],[{
@@ -2715,7 +2739,7 @@ function toggleEmpty(canvasId,emptyId,isEmpty){ $(canvasId).classList.toggle('hi
 function destroyChart(id){ if(charts[id]){charts[id].destroy();delete charts[id];} }
 function makeChart(id,type,labels,datasets,opts){ destroyChart(id); const ctx=$(id); if(!ctx)return; charts[id]=new Chart(ctx,{type,data:{labels,datasets},options:opts}); }
 
-window.addEventListener('load',()=>{ loadDashboard(false); setInterval(()=>loadDashboard(false),5*60*1000); });
+window.addEventListener('load',()=>{ initPeriodSelectors(); loadDashboard(false); setInterval(()=>loadDashboard(false),5*60*1000); });
 
 
 /* ===== Analytics Period Selector ===== */
