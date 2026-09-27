@@ -329,10 +329,55 @@ async function handleGetData(env, cors) {
   const beforeTodayInfo = maxMileageInfo(mileageEvents.filter(e => e.date < todayRome));
   const beforeTodayEvent = beforeTodayInfo ? beforeTodayInfo.lastSeen : null;
   let resolvedDailyKm = null;
+  let resolvedDailyKmSource = null;
+  let resolvedDailyKmTimestamp = null;
   if (currentMileageEvent && beforeTodayEvent && currentMileageChangedAt && dateKeyInRome(currentMileageChangedAt) === todayRome) {
     const d = currentMileageEvent.km - beforeTodayEvent.km;
-    if (d >= 0 && d < 1500) resolvedDailyKm = Math.round(d * 10) / 10;
+    if (d >= 0 && d < 1500) {
+      resolvedDailyKm = Math.round(d * 10) / 10;
+      resolvedDailyKmSource = currentMileageEvent.source || 'Odometro';
+      resolvedDailyKmTimestamp = currentMileageChangedAt;
+    }
   }
+
+  // Fallback: infer today's km from BMW's "driving distance this month".
+  // This sensor often refreshes independently from the main vehicle mileage.
+  if (resolvedDailyKm === null) {
+    try {
+      const monthEntity = 'sensor.x3_m40d_driving_distance_this_month';
+      const monthRows = await db.prepare(
+        `SELECT snapshot_timestamp, state, bmw_timestamp
+         FROM bmw_raw_daily
+         WHERE entity_id = ?
+         ORDER BY snapshot_timestamp DESC LIMIT 200`
+      ).bind(monthEntity).all();
+      const samples = (monthRows.results || []).map(r => ({
+        ts: r.bmw_timestamp || r.snapshot_timestamp,
+        v: Number(String(r.state || '').replace(',','.'))
+      })).filter(x => Number.isFinite(x.v) && x.ts)
+        .sort((a,b) => new Date(a.ts) - new Date(b.ts));
+
+      const currentMonthState = current[monthEntity];
+      if (currentMonthState) {
+        const v = Number(String(currentMonthState.value || '').replace(',','.'));
+        const ts0 = currentMonthState.bmw_timestamp || currentMonthState.last_updated;
+        if (Number.isFinite(v) && ts0) samples.push({ts:ts0,v});
+      }
+
+      const before = samples.filter(x => dateKeyInRome(x.ts) < todayRome).slice(-1)[0] || null;
+      const today = samples.filter(x => dateKeyInRome(x.ts) === todayRome);
+      const latest = today.length ? today[today.length-1] : null;
+      if (before && latest) {
+        const d = latest.v - before.v;
+        if (d >= 0 && d < 1500) {
+          resolvedDailyKm = Math.round(d * 10) / 10;
+          resolvedDailyKmSource = 'BMW distanza mese';
+          resolvedDailyKmTimestamp = latest.ts;
+        }
+      }
+    } catch (_) {}
+  }
+
   const mileageAgeHours = currentMileageChangedAt
     ? Math.max(0, (Date.now() - new Date(currentMileageChangedAt).getTime()) / 3600000)
     : null;
@@ -611,8 +656,8 @@ async function handleGetData(env, cors) {
     analytics,
     quick: {
       dailyKm: resolvedDailyKm,
-      dailyKmSource: currentMileageEvent ? currentMileageEvent.source : null,
-      dailyKmUpdatedAt: currentMileageEvent ? currentMileageEvent.timestamp : null,
+      dailyKmSource: resolvedDailyKmSource,
+      dailyKmUpdatedAt: resolvedDailyKmTimestamp,
       dailyKmStale: mileageAgeHours !== null ? mileageAgeHours > 6 : true,
       dailyKmBaseline: beforeTodayEvent ? beforeTodayEvent.km : null,
       consumptionL100: analytics.consumption.latest,
