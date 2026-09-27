@@ -283,21 +283,25 @@ async function handleGetData(env, cors) {
   }
 
   mileageEvents.sort((a,b) => new Date(a.timestamp) - new Date(b.timestamp));
-  const maxMileageEvent = events => {
+  const maxMileageInfo = events => {
     if (!events.length) return null;
     const maxKm = Math.max(...events.map(e => e.km));
-    const matching = events.filter(e => Math.abs(e.km - maxKm) < 0.01);
-    return matching[matching.length - 1] || null;
+    const matching = events.filter(e => Math.abs(e.km - maxKm) < 0.01)
+      .sort((a,b) => new Date(a.timestamp) - new Date(b.timestamp));
+    return { km:maxKm, firstSeen:matching[0]||null, lastSeen:matching[matching.length-1]||null };
   };
-  const currentMileageEvent = maxMileageEvent(mileageEvents);
-  const beforeTodayEvent = maxMileageEvent(mileageEvents.filter(e => e.date < todayRome));
+  const currentMileageInfo = maxMileageInfo(mileageEvents);
+  const currentMileageEvent = currentMileageInfo ? currentMileageInfo.lastSeen : null;
+  const currentMileageChangedAt = currentMileageInfo && currentMileageInfo.firstSeen ? currentMileageInfo.firstSeen.timestamp : null;
+  const beforeTodayInfo = maxMileageInfo(mileageEvents.filter(e => e.date < todayRome));
+  const beforeTodayEvent = beforeTodayInfo ? beforeTodayInfo.lastSeen : null;
   let resolvedDailyKm = null;
-  if (currentMileageEvent && beforeTodayEvent) {
+  if (currentMileageEvent && beforeTodayEvent && currentMileageChangedAt && dateKeyInRome(currentMileageChangedAt) === todayRome) {
     const d = currentMileageEvent.km - beforeTodayEvent.km;
     if (d >= 0 && d < 1500) resolvedDailyKm = Math.round(d * 10) / 10;
   }
-  const mileageAgeHours = currentMileageEvent
-    ? Math.max(0, (Date.now() - new Date(currentMileageEvent.timestamp).getTime()) / 3600000)
+  const mileageAgeHours = currentMileageChangedAt
+    ? Math.max(0, (Date.now() - new Date(currentMileageChangedAt).getTime()) / 3600000)
     : null;
 
   const progress = [];
@@ -460,7 +464,8 @@ async function handleGetData(env, cors) {
     core: {
       mileageKm: currentMileageEvent ? currentMileageEvent.km : toNum(state(mileageId)),
       mileageSource: currentMileageEvent ? currentMileageEvent.source : 'BMW/HA',
-      mileageUpdatedAt: currentMileageEvent ? currentMileageEvent.timestamp : ts(mileageId),
+      mileageUpdatedAt: currentMileageChangedAt || (currentMileageEvent ? currentMileageEvent.timestamp : ts(mileageId)),
+      mileageObservedAt: currentMileageEvent ? currentMileageEvent.timestamp : ts(mileageId),
       fuelPercent: toNum(state('sensor.x3_m40d_range_tank_level')),
       fuelLitres: toNum(state('sensor.x3_m40d_range_tank_level_2')),
       rangeKm: toNum(state('sensor.x3_m40d_range_total_range_last_sent')),
@@ -2204,8 +2209,8 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
         <div class="card-kicker">Stato vettura</div>
         <div class="status-main" id="lockState">—</div>
         <div class="check-list">
-          <div><b id="doorsIcon">✓</b><span>Porte chiuse</span><small id="doorsTs" style="display:block;color:var(--muted);font-size:0.7rem;margin-top:1px"></small></div>
-          <div><b id="windowsIcon">✓</b><span>Finestrini chiusi</span><small id="windowsTs" style="display:block;color:var(--muted);font-size:0.7rem;margin-top:1px"></small></div>
+          <div><b id="doorsIcon">✓</b><span id="doorsLabel">Porte chiuse</span><small id="doorsTs" style="display:block;color:var(--muted);font-size:0.7rem;margin-top:1px"></small></div>
+          <div><b id="windowsIcon">✓</b><span id="windowsLabel">Finestrini chiusi</span><small id="windowsTs" style="display:block;color:var(--muted);font-size:0.7rem;margin-top:1px"></small></div>
           <div><b id="hoodIcon">✓</b><span>Cofano chiuso</span><small id="hoodTs" style="display:block;color:var(--muted);font-size:0.7rem;margin-top:1px"></small></div>
           <div><b id="tailgateIcon">✓</b><span>Portellone chiuso</span><small id="tailgateTs" style="display:block;color:var(--muted);font-size:0.7rem;margin-top:1px"></small></div>
           <div><b id="sunroofIcon">✓</b><span>Tetto apribile chiuso</span><small id="sunroofTs" style="display:block;color:var(--muted);font-size:0.7rem;margin-top:1px"></small></div>
@@ -2423,7 +2428,7 @@ function renderDashboard(d){
   $('fuelBar').style.width=\`\${Math.max(0,Math.min(100,Number(d.core.fuelPercent)||0))}%\`;
   var mileageTs=d.core.mileageUpdatedAt||d.core.lastBmwTimestamp;
   $('lastBmw').textContent=dateTime(mileageTs);
-  $('freshness').innerHTML=\`<i></i>\${escapeHtml(ageLabel(mileageTs))}\`;
+  $('freshness').innerHTML=\`<i></i>\${escapeHtml('Odometro · '+ageLabel(mileageTs).replace('Dato BMW appena aggiornato','appena aggiornato').replace('Dato BMW: ',''))}\`;
   $('homePill').textContent=\`● \${locationLabel(d.core.locationState)}\`;
   // Status banner rendering
   var lkV = (d.security.lockState || '').toUpperCase();
@@ -2478,10 +2483,16 @@ function renderDashboard(d){
   if(d.security.tailgateTimestamp) $('tailgateTs').textContent=formatTimestamp(d.security.tailgateTimestamp);
   if(d.security.sunroofTimestamp) $('sunroofTs').textContent=formatTimestamp(d.security.sunroofTimestamp);
   boolIcon('doorsIcon',d.security.doorsClosed); boolIcon('windowsIcon',d.security.windowsClosed);
+  $('doorsLabel').textContent=d.security.doorsClosed?'Porte chiuse':'Porte aperte / da verificare';
+  $('windowsLabel').textContent=d.security.windowsClosed?'Finestrini chiusi':'Finestrini aperti / da verificare';
   boolIcon('hoodIcon',d.security.hoodClosed); boolIcon('tailgateIcon',d.security.tailgateClosed); boolIcon('sunroofIcon',d.security.sunroofClosed);
 
   const battOk=d.battery12v.rechargeRequired===0||d.battery12v.rechargeRequired===null;
-  $('batteryDisc').textContent=battOk?'✓':'!'; $('batteryDisc').style.background=battOk?'var(--green)':'var(--amber)'; $('batteryNote').textContent='Stato BMW'+(d.battery12v.bmwTimestamp?' · '+ageLabel(d.battery12v.bmwTimestamp):'');
+  const battTs=parseDate(d.battery12v.bmwTimestamp);
+  const battStale=battTs?((Date.now()-battTs.getTime())/3600000>48):true;
+  $('batteryDisc').textContent=battOk?'✓':'!';
+  $('batteryDisc').style.background=battStale?'var(--amber)':(battOk?'var(--green)':'var(--amber)');
+  $('batteryNote').textContent='Stato BMW'+(d.battery12v.bmwTimestamp?' · '+ageLabel(d.battery12v.bmwTimestamp):'');
   (() => {
     const hMap = {'200':'Buono ✅','0':'Scarica ⚠️','100':'Ricarica necessaria ⚠️'};
     const label = hMap[String(d.battery12v.rawHealthState)] || ('Codice: ' + (d.battery12v.rawHealthState || '—'));
@@ -2601,7 +2612,7 @@ function renderDashboard(d){
 function renderQuickStats(d){
   $('quickKm').textContent=d.quick.dailyKm===null?'—':\`\${fmt1(d.quick.dailyKm)} km\`;
   if(d.quick.dailyKm===null){
-    $('quickKmNote').textContent='baseline odometro non disponibile';
+    $('quickKmNote').textContent=d.core.mileageUpdatedAt?'odometro invariato da '+formatTimestamp(d.core.mileageUpdatedAt):'dato odometro non disponibile';
   }else if(d.quick.dailyKmStale){
     $('quickKmNote').textContent=(d.quick.dailyKm>0?'almeno ':'')+fmt1(d.quick.dailyKm)+' km · odometro da aggiornare';
   }else if(d.quick.dailyKm===0){
