@@ -55,11 +55,69 @@ async function ensureSchema(env) {
     'CREATE TABLE IF NOT EXISTS bmw_direct_raw (' +
     'id INTEGER PRIMARY KEY AUTOINCREMENT, fetched_at TEXT NOT NULL, kind TEXT NOT NULL, ' +
     'vin TEXT, payload_json TEXT NOT NULL);' +
-    'CREATE INDEX IF NOT EXISTS idx_bmw_direct_raw_time ON bmw_direct_raw(fetched_at DESC);'
+    'CREATE INDEX IF NOT EXISTS idx_bmw_direct_raw_time ON bmw_direct_raw(fetched_at DESC);' +
+    'CREATE TABLE IF NOT EXISTS bmw_direct_meta (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT);' +
+    'CREATE TABLE IF NOT EXISTS bmw_api_requests (' +
+    'id INTEGER PRIMARY KEY AUTOINCREMENT, requested_at TEXT NOT NULL, path TEXT NOT NULL, status INTEGER NOT NULL);' +
+    'CREATE INDEX IF NOT EXISTS idx_bmw_api_requests_time ON bmw_api_requests(requested_at DESC);'
   );
 }
 function configured(env) {
   return Boolean(env.BMW_CLIENT_ID && env.BMW_VIN && env.BMW_TOKEN_ENCRYPTION_KEY);
+}
+
+async function getMeta(env, key) {
+  await ensureSchema(env);
+  return env.DB.prepare('SELECT value, updated_at FROM bmw_direct_meta WHERE key=?').bind(key).first();
+}
+async function setMeta(env, key, value) {
+  await ensureSchema(env);
+  const now = new Date().toISOString();
+  await env.DB.prepare(
+    'INSERT INTO bmw_direct_meta (key,value,updated_at) VALUES (?,?,?) ' +
+    'ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at'
+  ).bind(key, String(value), now).run();
+  return now;
+}
+async function recordApiRequest(env, path, status) {
+  try {
+    await ensureSchema(env);
+    await env.DB.prepare(
+      'INSERT INTO bmw_api_requests (requested_at,path,status) VALUES (?,?,?)'
+    ).bind(new Date().toISOString(), path, Number(status)||0).run();
+  } catch (_) {}
+}
+async function quotaStatus(env) {
+  await ensureSchema(env);
+  const since = new Date(Date.now()-24*60*60*1000).toISOString();
+  const rows = await env.DB.prepare(
+    'SELECT requested_at,path,status FROM bmw_api_requests WHERE requested_at>=? ORDER BY requested_at ASC'
+  ).bind(since).all();
+  const list = rows.results || [];
+  const used = list.length;
+  const limit = 50;
+  const oldest = list[0]?.requested_at || null;
+  const nextReset = oldest ? new Date(Date.parse(oldest)+24*60*60*1000).toISOString() : null;
+  const started = await getMeta(env,'quota_tracking_started');
+  if(!started) await setMeta(env,'quota_tracking_started',new Date().toISOString());
+  const started2 = started || await getMeta(env,'quota_tracking_started');
+  return {
+    used,
+    remaining:Math.max(0,limit-used),
+    limit,
+    nextReset,
+    trackingStartedAt:started2?.value || null,
+    scope:'Cloudflare Worker only',
+    note:'Contatore locale rolling 24h; non include chiamate BMW fatte prima dell’attivazione o da altri client.'
+  };
+}
+async function latestRawAgeMs(env, kind) {
+  const row = await env.DB.prepare(
+    'SELECT fetched_at FROM bmw_direct_raw WHERE kind=? ORDER BY fetched_at DESC LIMIT 1'
+  ).bind(kind).first();
+  if(!row?.fetched_at) return Infinity;
+  const t=Date.parse(row.fetched_at);
+  return Number.isFinite(t)?Date.now()-t:Infinity;
 }
 async function getState(env) {
   await ensureSchema(env);
@@ -153,6 +211,7 @@ async function apiGet(env, path, accessToken) {
   const response = await fetch(BMW_API_BASE + path, {
     headers:{'Authorization':'Bearer ' + accessToken,'x-version':'v1','Accept':'application/json'}
   });
+  await recordApiRequest(env, path.split('?')[0], response.status);
   const text = await response.text();
   let data;
   try { data = text ? JSON.parse(text) : {}; } catch (_) { data = {raw:text}; }
@@ -172,8 +231,13 @@ async function apiGet(env, path, accessToken) {
   return data;
 }
 
-async function discoverContainerId(env, accessToken) {
+async function discoverContainerId(env, accessToken, {refresh=false} = {}) {
   if (env.BMW_CONTAINER_ID) return {id:env.BMW_CONTAINER_ID, source:'env'};
+  const cached = await getMeta(env,'container_id');
+  const cachedAge = cached?.updated_at ? Date.now()-Date.parse(cached.updated_at) : Infinity;
+  if (!refresh && cached?.value && Number.isFinite(cachedAge) && cachedAge < 7*24*60*60*1000) {
+    return {id:cached.value, source:'cached', count:null};
+  }
   const payload = await apiGet(env, '/customers/containers', accessToken);
   const containers = Array.isArray(payload) ? payload : (Array.isArray(payload?.containers) ? payload.containers : []);
   const candidates = containers.filter(x => x && typeof x.containerId === 'string');
@@ -184,6 +248,7 @@ async function discoverContainerId(env, accessToken) {
     x.name === 'BMW CarData HV Battery'
   );
   const chosen = preferred || candidates[candidates.length - 1];
+  await setMeta(env,'container_id',chosen.containerId);
   return {id:chosen.containerId, source:preferred ? 'bavariandata_named' : 'existing_latest', count:candidates.length};
 }
 const DIRECT_ALIAS_MAP = {
@@ -388,6 +453,7 @@ export async function handleBmwDirect(request, env, path) {
   await ensureSchema(env);
   if (path === '/api/bmw-direct/status' && request.method === 'GET') {
     const state = await getState(env);
+    const quota = await quotaStatus(env);
     return j({
       configured: configured(env),
       hasToken: Boolean(state?.token_blob),
@@ -399,7 +465,8 @@ export async function handleBmwDirect(request, env, path) {
       expiresAt: state?.expires_at || null,
       lastFetchAt: state?.last_fetch_at || null,
       lastFetchStatus: state?.last_fetch_status || null,
-      lastError: state?.last_error || null
+      lastError: state?.last_error || null,
+      apiQuota: quota
     });
   }
   if (!configured(env)) {
@@ -481,54 +548,78 @@ export async function runBmwDirectFetch(env, {force=false} = {}) {
   if (!configured(env)) return {ok:false, skipped:true, reason:'not_configured'};
   const state = await getState(env);
   if (!state?.token_blob) return {ok:false, skipped:true, reason:'not_authorized'};
+
+  const quotaBefore = await quotaStatus(env);
+  // Keep a 5-call safety reserve. Manual clicks must not burn through the full BMW allowance.
+  if (quotaBefore.used >= 45) {
+    return {ok:false, skipped:true, reason:'quota_guard', apiQuota:quotaBefore};
+  }
+
   if (!force && state.last_fetch_at) {
     const age = Date.now() - Date.parse(state.last_fetch_at);
-    if (Number.isFinite(age) && age < 3.5 * 60 * 60 * 1000) return {ok:true, skipped:true, reason:'recent_fetch'};
+    if (Number.isFinite(age) && age < 55 * 60 * 1000) {
+      return {ok:true, skipped:true, reason:'recent_fetch', apiQuota:quotaBefore};
+    }
   }
+
   const now = new Date().toISOString();
   try {
     let token = await validAccessToken(env);
     const vin = env.BMW_VIN;
-    const mappingResult = await getMappingsWithAuthRecovery(env, token);
-    const mappings = mappingResult.data;
-    if (mappingResult.recovered) token = await validAccessToken(env);
-    await saveRaw(env, 'mappings', vin, mappings);
-    const basic = await apiGet(env, '/customers/vehicles/' + encodeURIComponent(vin) + '/basicData', token);
-    await saveRaw(env, 'basicData', vin, basic);
-    const kinds = ['mappings','basicData'];
+    const kinds = [];
+    let container = null;
+
+    // Expensive/static metadata: at most once per 24 h.
+    const mappingsAge = await latestRawAgeMs(env,'mappings');
+    if (mappingsAge >= 24*60*60*1000) {
+      const mappingResult = await getMappingsWithAuthRecovery(env, token);
+      if (mappingResult.recovered) token = await validAccessToken(env);
+      await saveRaw(env,'mappings',vin,mappingResult.data);
+      kinds.push('mappings');
+    } else kinds.push('mappings:cached');
+
+    const basicAge = await latestRawAgeMs(env,'basicData');
+    if (basicAge >= 24*60*60*1000) {
+      const basic = await apiGet(env,'/customers/vehicles/' + encodeURIComponent(vin) + '/basicData',token);
+      await saveRaw(env,'basicData',vin,basic);
+      kinds.push('basicData');
+    } else kinds.push('basicData:cached');
+
+    // Container list: cached for 7 days. This removes one REST call from normal refreshes.
+    container = await discoverContainerId(env, token, {refresh:false});
+
     let dayDistance = {updated:false, reason:'telematic_not_fetched'};
-    const container = await discoverContainerId(env, token);
     if (container.id) {
       const telematic = await apiGet(
         env,
         '/customers/vehicles/' + encodeURIComponent(vin) + '/telematicData?containerId=' + encodeURIComponent(container.id),
         token
       );
-      await saveRaw(env, 'telematicData', vin, telematic);
-      const ingestion = await ingestDirectTelematic(env, vin, telematic, now);
-      dayDistance = await recomputeObservedDailyDistance(env, now);
+      await saveRaw(env,'telematicData',vin,telematic);
+      const ingestion = await ingestDirectTelematic(env,vin,telematic,now);
+      dayDistance = await recomputeObservedDailyDistance(env,now);
       kinds.push('telematicData');
       kinds.push('current:' + ingestion.descriptorCount);
-      if (dayDistance.updated) kinds.push('todayKm:' + dayDistance.distanceKm);
-      else kinds.push('todayKm:n/a');
+      kinds.push(dayDistance.updated ? ('todayKm:' + dayDistance.distanceKm) : 'todayKm:n/a');
     }
-    await saveState(env, {last_fetch_at:now,last_fetch_status:kinds.join('+'),last_error:null,updated_at:now});
+
+    const quotaAfter = await quotaStatus(env);
+    await saveState(env,{last_fetch_at:now,last_fetch_status:kinds.join('+'),last_error:null,updated_at:now});
     return {
-      ok:true,
-      fetchedAt:now,
-      kinds,
+      ok:true,fetchedAt:now,kinds,
       telematicConfigured:Boolean(container.id),
       containerSource:container.source,
       containerCount:container.count ?? null,
-      dayDistance
+      dayDistance,
+      apiQuota:quotaAfter
     };
   } catch (err) {
     const message = err?.message || String(err);
-    await saveState(env, {last_fetch_at:now,last_fetch_status:'error',last_error:message,updated_at:now});
-    return {ok:false,error:message};
+    const quotaAfter = await quotaStatus(env);
+    await saveState(env,{last_fetch_at:now,last_fetch_status:'error',last_error:message,updated_at:now});
+    return {ok:false,error:message,apiQuota:quotaAfter};
   }
 }
-
 
 export function serveBmwDirectPage() {
   return new Response(`<!doctype html>
@@ -552,6 +643,10 @@ a{color:#7eb5ff}.muted{color:#9fb2c7}.ok{color:#78e39b}.bad{color:#ff9a9a}
   <pre id="status">Caricamento…</pre>
 </div>
 <div class="card">
+  <h3>Quota BMW REST</h3>
+  <div id="quota" class="muted">Caricamento…</div>
+</div>
+<div class="card">
   <h3>2. Autorizzazione BMW</h3>
   <button onclick="startAuth()">Avvia Device Code Flow</button>
   <div id="auth" class="muted">Non avviato.</div>
@@ -572,6 +667,10 @@ async function api(path,method='GET'){
 async function status(){
   const x=await api('/api/bmw-direct/status');
   document.getElementById('status').textContent=JSON.stringify(x.j,null,2);
+  const q=x.j.apiQuota;
+  if(q){
+    document.getElementById('quota').innerHTML='<b>'+q.used+' / '+q.limit+'</b> richieste Cloudflare nelle ultime 24 h · stima residue <b>'+q.remaining+'</b>'+(q.nextReset?'<br>Prima quota che si libera: '+new Date(q.nextReset).toLocaleString('it-IT'):'')+'<br><span class="muted">Contatore locale: non include vecchie chiamate o altri client.</span>';
+  }
 }
 async function startAuth(){
   const x=await api('/api/bmw-direct/device/start','POST');
