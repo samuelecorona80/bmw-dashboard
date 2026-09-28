@@ -464,6 +464,7 @@ export async function runBmwDirectFetch(env, {force=false} = {}) {
     const basic = await apiGet(env, '/customers/vehicles/' + encodeURIComponent(vin) + '/basicData', token);
     await saveRaw(env, 'basicData', vin, basic);
     const kinds = ['mappings','basicData'];
+    let dayDistance = {updated:false, reason:'telematic_not_fetched'};
     const container = await discoverContainerId(env, token);
     if (container.id) {
       const telematic = await apiGet(
@@ -473,7 +474,7 @@ export async function runBmwDirectFetch(env, {force=false} = {}) {
       );
       await saveRaw(env, 'telematicData', vin, telematic);
       const ingestion = await ingestDirectTelematic(env, vin, telematic, now);
-      const dayDistance = await recomputeObservedDailyDistance(env, now);
+      dayDistance = await recomputeObservedDailyDistance(env, now);
       kinds.push('telematicData');
       kinds.push('current:' + ingestion.descriptorCount);
       if (dayDistance.updated) kinds.push('todayKm:' + dayDistance.distanceKm);
@@ -487,7 +488,7 @@ export async function runBmwDirectFetch(env, {force=false} = {}) {
       telematicConfigured:Boolean(container.id),
       containerSource:container.source,
       containerCount:container.count ?? null,
-      dayDistance: typeof dayDistance !== 'undefined' ? dayDistance : null
+      dayDistance
     };
   } catch (err) {
     const message = err?.message || String(err);
