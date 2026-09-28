@@ -61,9 +61,15 @@ jobs:
 
       - name: Verify production endpoint
         run: |
-          # The dashboard is password-protected in production. A healthy
-          # unauthenticated request must return 401 with a Basic auth challenge.
-          code=$(curl --silent --show-error --retry 5 --retry-delay 5 -D /tmp/headers.txt -o /tmp/body.txt -w "%{http_code}" https://bmw.samuelecorona.it/api/data)
-          test "$code" = "401" || (echo "Expected HTTP 401 from protected production API, got $code" && cat /tmp/body.txt && exit 1)
-          grep -qi '^www-authenticate: Basic ' /tmp/headers.txt || (echo "Missing Basic auth challenge" && cat /tmp/headers.txt && exit 1)
-          echo "Production API protected and reachable"
+          login_code=$(curl --silent --show-error --retry 5 --retry-delay 5 -o /tmp/login.html -w "%{http_code}" https://bmw.samuelecorona.it/login)
+          test "$login_code" = "200" || (echo "Login page unavailable: HTTP $login_code" && exit 1)
+          grep -q 'Ricordami su questo dispositivo' /tmp/login.html || (echo "Persistent login form missing" && exit 1)
+
+          api_code=$(curl --silent --show-error -o /tmp/api.json -w "%{http_code}" https://bmw.samuelecorona.it/api/data)
+          test "$api_code" = "401" || (echo "Expected protected API HTTP 401, got $api_code" && cat /tmp/api.json && exit 1)
+          python - <<'PY'
+          import json
+          d=json.load(open("/tmp/api.json"))
+          assert d.get("error")=="authentication_required"
+          print("Login page and protected API OK")
+          PY
