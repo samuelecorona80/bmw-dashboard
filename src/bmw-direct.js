@@ -101,6 +101,13 @@ async function quotaStatus(env) {
   const started = await getMeta(env,'quota_tracking_started');
   if(!started) await setMeta(env,'quota_tracking_started',new Date().toISOString());
   const started2 = started || await getMeta(env,'quota_tracking_started');
+  const remoteLimited = await getMeta(env,'remote_rate_limited_at');
+  const remoteRetry = await getMeta(env,'remote_retry_after');
+  let remoteEstimatedReset = null;
+  if (remoteLimited?.value) {
+    const t = Date.parse(remoteLimited.value);
+    if (Number.isFinite(t)) remoteEstimatedReset = new Date(t + 24*60*60*1000).toISOString();
+  }
   return {
     used,
     remaining:Math.max(0,limit-used),
@@ -108,6 +115,9 @@ async function quotaStatus(env) {
     nextReset,
     trackingStartedAt:started2?.value || null,
     scope:'Cloudflare Worker only',
+    remoteRateLimitedAt:remoteLimited?.value || null,
+    remoteRetryAfter:remoteRetry?.value || null,
+    remoteEstimatedReset,
     note:'Contatore locale rolling 24h; non include chiamate BMW fatte prima dell’attivazione o da altri client.'
   };
 }
@@ -225,8 +235,15 @@ async function apiGet(env, path, accessToken) {
       data?.error_description ||
       (typeof data?.raw === 'string' ? data.raw.slice(0,180) : null) ||
       'request_failed';
+    const detailText = String(detail);
+    if (detailText.includes('CU-429') || /rate limit reached/i.test(detailText)) {
+      const now = new Date().toISOString();
+      await setMeta(env,'remote_rate_limited_at',now);
+      const retryAfter = response.headers.get('Retry-After');
+      if (retryAfter) await setMeta(env,'remote_retry_after',retryAfter);
+    }
     const safePath = path.replace(/([?&](?:access_token|token|refresh_token)=)[^&]+/gi,'$1REDACTED');
-    throw new Error('BMW_API_' + response.status + ':' + safePath + ':' + String(detail).slice(0,220));
+    throw new Error('BMW_API_' + response.status + ':' + safePath + ':' + detailText.slice(0,220));
   }
   return data;
 }
@@ -550,6 +567,13 @@ export async function runBmwDirectFetch(env, {force=false} = {}) {
   if (!state?.token_blob) return {ok:false, skipped:true, reason:'not_authorized'};
 
   const quotaBefore = await quotaStatus(env);
+  // If BMW itself has told us the remote quota is exhausted, pause calls for 24 h
+  // from the first observed CU-429. This avoids wasting requests while the local
+  // counter is still incomplete because tracking started later than BMW usage.
+  if (quotaBefore.remoteRateLimitedAt && quotaBefore.remoteEstimatedReset &&
+      Date.parse(quotaBefore.remoteEstimatedReset) > Date.now()) {
+    return {ok:false, skipped:true, reason:'bmw_remote_rate_limit', apiQuota:quotaBefore};
+  }
   // Keep a 5-call safety reserve. Manual clicks must not burn through the full BMW allowance.
   if (quotaBefore.used >= 45) {
     return {ok:false, skipped:true, reason:'quota_guard', apiQuota:quotaBefore};
@@ -669,7 +693,13 @@ async function status(){
   document.getElementById('status').textContent=JSON.stringify(x.j,null,2);
   const q=x.j.apiQuota;
   if(q){
-    document.getElementById('quota').innerHTML='<b>'+q.used+' / '+q.limit+'</b> richieste Cloudflare nelle ultime 24 h · stima residue <b>'+q.remaining+'</b>'+(q.nextReset?'<br>Prima quota che si libera: '+new Date(q.nextReset).toLocaleString('it-IT'):'')+'<br><span class="muted">Contatore locale: non include vecchie chiamate o altri client.</span>';
+    var remote='';
+    if(q.remoteRateLimitedAt){
+      remote='<br><span class="bad"><b>BMW segnala quota esaurita</b> dal '+new Date(q.remoteRateLimitedAt).toLocaleString('it-IT')+'</span>';
+      if(q.remoteRetryAfter) remote+=' · Retry-After: '+q.remoteRetryAfter;
+      if(q.remoteEstimatedReset) remote+='<br>Riprova automatica stimata dopo '+new Date(q.remoteEstimatedReset).toLocaleString('it-IT');
+    }
+    document.getElementById('quota').innerHTML='<b>'+q.used+' / '+q.limit+'</b> richieste Cloudflare nelle ultime 24 h · stima residue <b>'+q.remaining+'</b>'+(q.nextReset?'<br>Prima quota locale che si libera: '+new Date(q.nextReset).toLocaleString('it-IT'):'')+remote+'<br><span class="muted">Contatore locale: non include vecchie chiamate o altri client.</span>';
   }
 }
 async function startAuth(){
