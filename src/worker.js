@@ -2598,6 +2598,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
           <div class="eyebrow">Ultimo dato BMW</div>
           <div class="time" id="lastBmw">—</div>
           <div class="freshness" id="freshness"><i></i> Caricamento…</div>
+          <div class="mini-note" style="margin-top:4px">Sync HA → D1: <strong id="lastHaSync">—</strong></div>
         </div>
         <button class="refresh" id="refreshBtn" onclick="loadDashboard(true)" title="Aggiorna">↻</button>
       </div>
@@ -2971,6 +2972,11 @@ function renderDashboard(d){
   $('fuelBar').style.width=\`\${Math.max(0,Math.min(100,Number(d.core.fuelPercent)||0))}%\`;
   var mileageTs=d.core.mileageUpdatedAt||d.core.lastBmwTimestamp;
   $('lastBmw').textContent=dateTime(mileageTs);
+  var pipeFresh=(d.freshness&&d.freshness.pipeline)||{status:'unknown',timestamp:null};
+  if($('lastHaSync')){
+    $('lastHaSync').textContent=pipeFresh.timestamp?formatTimestamp(pipeFresh.timestamp)+' · '+ageLabel(pipeFresh.timestamp):'non disponibile';
+    $('lastHaSync').style.color=pipeFresh.status==='fresh'?'var(--green)':(pipeFresh.status==='stale'?'var(--amber)':'var(--red)');
+  }
   var odFresh=(d.freshness&&d.freshness.odometer)||{status:'unknown'};
   $('freshness').className='freshness '+(odFresh.status||'unknown');
   $('freshness').style.color=odFresh.status==='fresh'?'var(--green)':(odFresh.status==='stale'?'var(--amber)':'var(--red)');
