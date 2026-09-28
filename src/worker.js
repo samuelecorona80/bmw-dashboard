@@ -1,3 +1,5 @@
+import { handleBmwDirect, runBmwDirectFetch } from './bmw-direct.js';
+
 /**
  * BMW X3 M40d — Cloudflare Worker + D1
  * Complete port from Google Apps Script
@@ -152,6 +154,10 @@ function unauthenticatedApi() {
 }
 
 export default {
+  async scheduled(controller, env, ctx) {
+    ctx.waitUntil(runBmwDirectFetch(env));
+  },
+
   async fetch(request, env) {
     const url = new URL(request.url);
     const path = url.pathname;
@@ -169,6 +175,11 @@ export default {
         return loginPage(url.searchParams.get('next') || '/');
       }
       if (path === '/logout' && request.method === 'GET') return logoutResponse();
+
+      if (path.startsWith('/api/bmw-direct/')) {
+        if (!(await validSession(request, env))) return unauthenticatedApi();
+        return await handleBmwDirect(request, env, path);
+      }
 
       // Telemetry ingestion remains reachable without a browser session.
       // Other pages and APIs require the signed session cookie.
