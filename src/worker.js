@@ -415,6 +415,7 @@ async function handleGetData(env, cors) {
   const dailyRows = await db.prepare(
     'SELECT * FROM bmw_daily ORDER BY snapshot_date DESC LIMIT 60'
   ).all();
+  const latestSnapshotTimestamp = dailyRows.results.length ? dailyRows.results[0].snapshot_timestamp : null;
   const history = dailyRows.results.reverse().map(r => {
     const d = r.data_json ? JSON.parse(r.data_json) : {};
     const n = v => { const x = parseFloat(String(v || '').replace(',','.')); return isFinite(x) ? x : null; };
@@ -734,12 +735,13 @@ async function handleGetData(env, cors) {
   };
   const lockFreshTs=ts('sensor.x3_m40d_doors_overall_state')||ts('sensor.wbatx91030lp62133_doors_lock')||ts('vehicle.cabin.door.status');
   const freshness={
-    odometer:{timestamp:currentMileageChangedAt||null,status:freshClass(currentMileageChangedAt,6,24)},
-    fuel:{timestamp:ts('sensor.x3_m40d_range_tank_level')||ts('sensor.x3_m40d_range_total_range_last_sent'),status:freshClass(ts('sensor.x3_m40d_range_tank_level')||ts('sensor.x3_m40d_range_total_range_last_sent'),6,48)},
-    tyres:{timestamp:tyres.bmwTimestamp,status:freshClass(tyres.bmwTimestamp,24,96)},
-    battery:{timestamp:ts('sensor.wbatx91030lp62133_battery_recharge_required'),status:freshClass(ts('sensor.wbatx91030lp62133_battery_recharge_required'),24,72)},
-    location:{timestamp:locationTimestamp,status:freshClass(locationTimestamp,6,48)},
-    security:{timestamp:lockFreshTs,status:freshClass(lockFreshTs,6,48)}
+    odometer:{timestamp:currentMileageChangedAt||null,status:freshClass(currentMileageChangedAt,24,72)},
+    fuel:{timestamp:ts('sensor.x3_m40d_range_tank_level')||ts('sensor.x3_m40d_range_total_range_last_sent'),status:freshClass(ts('sensor.x3_m40d_range_tank_level')||ts('sensor.x3_m40d_range_total_range_last_sent'),24,72)},
+    tyres:{timestamp:tyres.bmwTimestamp,status:freshClass(tyres.bmwTimestamp,72,168)},
+    battery:{timestamp:ts('sensor.wbatx91030lp62133_battery_recharge_required'),status:freshClass(ts('sensor.wbatx91030lp62133_battery_recharge_required'),168,720)},
+    location:{timestamp:locationTimestamp,status:freshClass(locationTimestamp,24,72)},
+    security:{timestamp:lockFreshTs,status:freshClass(lockFreshTs,24,72)},
+    pipeline:{timestamp:latestSnapshotTimestamp,status:freshClass(latestSnapshotTimestamp,4,12)}
   };
   const anomalies=[];
   if(freshness.odometer.status==='old') anomalies.push({severity:'warn',text:'Odometro non aggiornato da oltre 24 ore',timestamp:freshness.odometer.timestamp});
@@ -848,7 +850,8 @@ async function handleGetData(env, cors) {
     meta: {
       monitoredEntities: Object.keys(current).length,
       historyRows: history.length,
-      tankCapacityLitres: FUEL_TANK_CAPACITY_L
+      tankCapacityLitres: FUEL_TANK_CAPACITY_L,
+      latestSnapshotTimestamp
     },
     extra: {
       tripEcoPro: toNum(state('sensor.x3_m40d_trip_eco_pro_mode_share')),
@@ -2742,16 +2745,25 @@ function renderDashboard(d){
   $('lastBmw').textContent=dateTime(mileageTs);
   var odFresh=(d.freshness&&d.freshness.odometer)||{status:'unknown'};
   $('freshness').className='freshness '+(odFresh.status||'unknown');
+  $('freshness').style.color=odFresh.status==='fresh'?'var(--green)':(odFresh.status==='stale'?'var(--amber)':'var(--red)');
+  var freshnessDot=$('freshness').querySelector('i');
+  if(freshnessDot) freshnessDot.style.background=odFresh.status==='fresh'?'var(--green)':(odFresh.status==='stale'?'var(--amber)':'var(--red)');
   $('freshness').innerHTML='<i></i>'+escapeHtml('Odometro · '+ageLabel(mileageTs).replace('Dato BMW appena aggiornato','appena aggiornato').replace('Dato BMW: ',''));
   $('homePill').textContent=\`● \${locationLabel(d.core.locationState)}\`;
   if($('dataHealth')){
-    var fs=d.freshness||{}, vals=Object.values(fs), total=vals.length;
+    var fs=d.freshness||{};
+    var keys=['odometer','fuel','tyres','battery','location','security'];
+    var vals=keys.map(function(k){return fs[k]}).filter(Boolean), total=keys.length;
     var recent=vals.filter(function(x){return x&&x.status==='fresh';}).length;
-    var usable=vals.filter(function(x){return x&&x.status!=='old'&&x.status!=='unknown';}).length;
-    var stateColor=recent===total?'var(--green)':(usable>=Math.ceil(total/2)?'var(--amber)':'var(--red)');
-    $('dataHealth').textContent='● '+recent+'/'+total+' fonti fresche';
+    var pipe=fs.pipeline||{status:'unknown',timestamp:null};
+    var pipeOk=pipe.status==='fresh';
+    var pipeStale=pipe.status==='stale';
+    var stateColor=pipeOk?'var(--green)':(pipeStale?'var(--amber)':'var(--red)');
+    var prefix=pipeOk?'Flusso attivo':(pipeStale?'Flusso in ritardo':'Flusso dati fermo');
+    $('dataHealth').textContent='● '+prefix+' · '+recent+'/'+total+' dati recenti';
     $('dataHealth').style.color=stateColor;
     $('dataHealth').style.borderColor=stateColor;
+    $('dataHealth').title=pipe.timestamp?('Ultimo invio: '+formatTimestamp(pipe.timestamp)):'Ultimo invio non disponibile';
   }
   // Status banner rendering
   var lkV = (d.security.lockState || '').toUpperCase();
