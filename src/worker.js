@@ -164,7 +164,7 @@ export default {
     const cors = {
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
     };
     if (request.method === 'OPTIONS') return new Response(null, { headers: cors });
 
@@ -186,17 +186,25 @@ export default {
         return await handleBmwDirect(request, env, path);
       }
 
-      // Telemetry ingestion remains reachable without a browser session.
-      // Other pages and APIs require the signed session cookie.
-      const isTelemetryPost = request.method === 'POST' && path !== '/update-price';
-      if (!isTelemetryPost && !(await validSession(request, env))) {
+      // Only the dedicated ingestion endpoint is allowed without a browser session.
+      // It must present the configured BMW_WRITE_TOKEN as a Bearer token.
+      const isTelemetryPost = request.method === 'POST' && path === '/api/ingest';
+      if (isTelemetryPost) {
+        if (!env.BMW_WRITE_TOKEN) return jsonResponse({error:'ingest_secret_missing'}, 503, cors);
+        const auth = request.headers.get('Authorization') || '';
+        const expected = 'Bearer ' + env.BMW_WRITE_TOKEN;
+        if (auth !== expected) return jsonResponse({error:'unauthorized_ingest'}, 401, cors);
+        return await handlePost(request, env, cors);
+      }
+
+      if (!(await validSession(request, env))) {
         if (path.startsWith('/api/')) return unauthenticatedApi();
         return loginPage(path + url.search);
       }
 
       if (request.method === 'POST') {
         if (path === '/update-price') return updatePrice(request, env, cors);
-        return await handlePost(request, env, cors);
+        return jsonResponse({error:'not_found'}, 404, cors);
       }
       if (path === '/api/data')      return await handleGetData(env, cors);
       if (path === '/api/analytics') return await handleGetAnalytics(env, parseInt(url.searchParams.get('days') || '30'), cors);
