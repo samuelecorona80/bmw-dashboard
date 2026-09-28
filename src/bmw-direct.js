@@ -156,7 +156,18 @@ async function apiGet(env, path, accessToken) {
   const text = await response.text();
   let data;
   try { data = text ? JSON.parse(text) : {}; } catch (_) { data = {raw:text}; }
-  if (!response.ok) throw new Error('BMW_API_' + response.status + ':' + (data?.errorId || data?.error || 'request_failed'));
+  if (!response.ok) {
+    const detail =
+      data?.errorId ||
+      data?.error ||
+      data?.message ||
+      data?.description ||
+      data?.error_description ||
+      (typeof data?.raw === 'string' ? data.raw.slice(0,180) : null) ||
+      'request_failed';
+    const safePath = path.replace(/([?&](?:access_token|token|refresh_token)=)[^&]+/gi,'$1REDACTED');
+    throw new Error('BMW_API_' + response.status + ':' + safePath + ':' + String(detail).slice(0,220));
+  }
   return data;
 }
 
