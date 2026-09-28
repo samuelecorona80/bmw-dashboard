@@ -2613,7 +2613,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
             <span class="pill" id="homePill">● Stato vettura</span>
             <button type="button" class="pill pill-button" id="dataHealth" onclick="toggleDataHealth()" style="font-size:11px;padding:7px 10px">◌ Stato dati</button>
             <span class="pill" id="tripBadge" style="display:none;background:var(--amber);color:#000;animation:pulse 1.5s infinite">🏎️ In viaggio</span>
-            <span class="pill">Controllo automatico ogni ora</span>
+            <span class="pill">Aggiornamento via Home Assistant</span>
              <a href="/vehicle-info" class="pill" style="text-decoration:none;background:rgba(67,142,255,.2);color:var(--accent)">📋 Scheda veicolo</a>
              <a href="/trips" class="pill" style="text-decoration:none;background:rgba(92,221,142,.2);color:var(--green)">🗺️ Viaggi</a>
              <a href="/fuel" class="pill" style="text-decoration:none;background:rgba(255,181,92,.2);color:#ffb55c">⛽ Carburante</a>
@@ -2933,20 +2933,17 @@ function renderDataHealth(d,direct){
     return '<div class="health-item"><small>'+a[0]+'</small><strong style="color:'+col+'">'+label+'</strong><div class="mini-note">'+(x.timestamp?escapeHtml(ageLabel(x.timestamp)):'Timestamp non disponibile')+'</div></div>';
   }).join('');
   if(direct){
-    var q=direct.apiQuota||{}, limited=Boolean(q.remoteRateLimitedAt && q.remoteEstimatedReset && Date.parse(q.remoteEstimatedReset)>Date.now());
-    var directState=limited?'Quota BMW esaurita':(direct.lastError?'Errore ultimo fetch':(direct.hasToken?'Connesso':'Non autorizzato'));
-    var col=limited||direct.lastError?'var(--red)':(direct.hasToken?'var(--green)':'var(--amber)');
-    html+='<div class="health-item"><small>BMW Direct</small><strong style="color:'+col+'">'+escapeHtml(directState)+'</strong><div class="mini-note">'+(direct.lastFetchAt?'Ultimo fetch '+escapeHtml(formatTimestamp(direct.lastFetchAt)):'Nessun fetch')+'</div></div>';
-    html+='<div class="health-item"><small>Quota locale</small><strong>'+((q.used??'—')+' / '+(q.limit??50))+'</strong><div class="mini-note">'+(limited?'BMW ha segnalato rate limit':'Tracking Worker ultime 24h')+'</div></div>';
-    html+='<div class="health-item"><small>Token</small><strong>'+(direct.expiresAt?escapeHtml(formatTimestamp(direct.expiresAt)):'N.d.')+'</strong><div class="mini-note">'+(direct.scope?'OAuth BMW attivo':'Scope non disponibile')+'</div></div>';
-    if(pill){pill.textContent=limited?'! Quota BMW esaurita':(direct.lastError?'! BMW Direct errore':'● BMW Direct');pill.style.color=col;pill.style.borderColor=col;}
-    $('healthSummary').textContent=limited?'BMW ha bloccato temporaneamente le REST API per rate limit.':(direct.lastError?'Ultimo fetch BMW con errore.':'Connessione diretta BMW monitorata dal Worker.');
-  } else if($('healthSummary')) $('healthSummary').textContent='Stato BMW Direct non disponibile.';
+    var q=direct.apiQuota||{};
+    html+='<div class="health-item"><small>Sorgente primaria</small><strong style="color:var(--green)">Home Assistant</strong><div class="mini-note">BavarianData → HA → D1</div></div>';
+    html+='<div class="health-item"><small>BMW Direct</small><strong style="color:var(--muted)">Fallback manuale</strong><div class="mini-note">'+(direct.lastFetchAt?'Ultimo test '+escapeHtml(formatTimestamp(direct.lastFetchAt)):'Nessun fetch automatico')+'</div></div>';
+    html+='<div class="health-item"><small>REST Worker</small><strong>'+(q.used??'—')+'</strong><div class="mini-note">Richieste Worker tracciate nelle ultime 24h</div></div>';
+    if(pill){pill.textContent='● Flusso Home Assistant';pill.style.color='var(--green)';pill.style.borderColor='var(--green)';}
+    $('healthSummary').textContent='Home Assistant è la sorgente primaria. BMW Direct è disponibile solo come fallback manuale.';
+  } else if($('healthSummary')) $('healthSummary').textContent='Home Assistant è la sorgente primaria.';
   if(grid) grid.innerHTML=html;
 }
 function renderAttention(d,direct){
-  var items=[],q=direct&&direct.apiQuota;
-  if(q&&q.remoteRateLimitedAt&&q.remoteEstimatedReset&&Date.parse(q.remoteEstimatedReset)>Date.now()) items.push({level:'alert',text:'BMW API: quota esaurita'});
+  var items=[];
   if(d.tyres&&d.tyres.alerts&&d.tyres.alerts.any) items.push({level:'warn',text:'Pressione pneumatici fuori target'});
   if(d.tyres&&d.tyres.trendAlerts&&d.tyres.trendAlerts.any) items.push({level:'warn',text:'Variazione pressione pneumatici'});
   if(d.security){
