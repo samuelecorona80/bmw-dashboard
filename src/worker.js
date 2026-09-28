@@ -1,4 +1,4 @@
-import { handleBmwDirect, runBmwDirectFetch } from './bmw-direct.js';
+import { handleBmwDirect, runBmwDirectFetch, serveBmwDirectPage } from './bmw-direct.js';
 
 /**
  * BMW X3 M40d — Cloudflare Worker + D1
@@ -175,6 +175,11 @@ export default {
         return loginPage(url.searchParams.get('next') || '/');
       }
       if (path === '/logout' && request.method === 'GET') return logoutResponse();
+
+      if (path === '/bmw-direct' && request.method === 'GET') {
+        if (!(await validSession(request, env))) return loginPage(path);
+        return serveBmwDirectPage();
+      }
 
       if (path.startsWith('/api/bmw-direct/')) {
         if (!(await validSession(request, env))) return unauthenticatedApi();
