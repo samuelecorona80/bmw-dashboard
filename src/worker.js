@@ -245,6 +245,34 @@ function haversineKm(aLat,aLng,bLat,bLng){
   return 2*R*Math.asin(Math.sqrt(s));
 }
 
+async function getLocationLabel(db, location){
+  if(!location || !Number.isFinite(Number(location.lat)) || !Number.isFinite(Number(location.lng))) return null;
+  try{
+    await db.exec('CREATE TABLE IF NOT EXISTS bmw_geocode_cache (cache_key TEXT PRIMARY KEY, lat REAL, lng REAL, label TEXT, display_name TEXT, fetched_at TEXT)');
+    const lat=Number(location.lat), lng=Number(location.lng);
+    const key=lat.toFixed(4)+','+lng.toFixed(4);
+    const cached=await db.prepare('SELECT label, display_name, fetched_at FROM bmw_geocode_cache WHERE cache_key=?').bind(key).first();
+    if(cached && cached.fetched_at && Date.now()-Date.parse(cached.fetched_at)<7*86400000){
+      return {label:cached.label||cached.display_name, displayName:cached.display_name||cached.label, source:'cache'};
+    }
+    const u='https://nominatim.openstreetmap.org/reverse?format=jsonv2&addressdetails=1&zoom=18&lat='+encodeURIComponent(lat)+'&lon='+encodeURIComponent(lng);
+    const r=await fetch(u,{headers:{'Accept':'application/json','Accept-Language':'it','User-Agent':'samuele-bmw-dashboard/1.0'}});
+    if(!r.ok) return cached?{label:cached.label||cached.display_name,displayName:cached.display_name||cached.label,source:'cache'}:null;
+    const x=await r.json(), a=x.address||{};
+    const poi=a.amenity||a.shop||a.tourism||a.leisure||a.office||a.building||null;
+    const road=a.road||a.pedestrian||a.residential||a.path||a.cycleway||null;
+    const house=a.house_number||null;
+    const locality=a.city||a.town||a.village||a.municipality||a.suburb||null;
+    let label=poi || [road,house].filter(Boolean).join(' ');
+    if(label && locality && !String(label).includes(locality)) label += ' · '+locality;
+    if(!label) label=x.name||x.display_name||null;
+    const fetchedAt=new Date().toISOString();
+    await db.prepare('INSERT INTO bmw_geocode_cache(cache_key,lat,lng,label,display_name,fetched_at) VALUES(?,?,?,?,?,?) ON CONFLICT(cache_key) DO UPDATE SET lat=excluded.lat,lng=excluded.lng,label=excluded.label,display_name=excluded.display_name,fetched_at=excluded.fetched_at')
+      .bind(key,lat,lng,label,x.display_name||label,fetchedAt).run();
+    return {label,displayName:x.display_name||label,source:'OpenStreetMap'};
+  }catch(_){return null}
+}
+
 async function getLocalDieselPrice(location){
   if(!location || !Number.isFinite(Number(location.lat)) || !Number.isFinite(Number(location.lng))) return null;
   try{
@@ -503,12 +531,19 @@ async function handleGetData(env, cors) {
   };
   try {
     const rawMileage = await db.prepare(
-      `SELECT snapshot_timestamp, state, bmw_timestamp
+      `SELECT snapshot_timestamp, state, bmw_timestamp, trigger_reason, attributes_json
        FROM bmw_raw_daily
        WHERE entity_id = 'sensor.x3_m40d_vehicle_mileage'
        ORDER BY snapshot_timestamp DESC LIMIT 400`
     ).all();
-    for (const r of rawMileage.results) pushMileage(r.state, r.bmw_timestamp || r.snapshot_timestamp, 'BMW/HA');
+    for (const r of rawMileage.results) {
+      let src = r.trigger_reason === 'cloudflare_direct' ? 'BMW CarData · Cloudflare' : 'Storico precedente';
+      try {
+        const a = r.attributes_json ? JSON.parse(r.attributes_json) : {};
+        if (a && a.source === 'cloudflare_direct') src = 'BMW CarData · Cloudflare';
+      } catch (_) {}
+      pushMileage(r.state, r.bmw_timestamp || r.snapshot_timestamp, src);
+    }
   } catch (_) {}
   try {
     const cardataMileage = await db.prepare(
@@ -527,10 +562,15 @@ async function handleGetData(env, cors) {
 
   const currentMileageEntity = current['sensor.x3_m40d_vehicle_mileage'];
   if (currentMileageEntity) {
+    let currentMileageSource = 'Storico precedente';
+    try {
+      const a = currentMileageEntity.attributes_json ? JSON.parse(currentMileageEntity.attributes_json) : {};
+      if (a && a.source === 'cloudflare_direct') currentMileageSource = 'BMW CarData · Cloudflare';
+    } catch (_) {}
     pushMileage(
       currentMileageEntity.value,
       currentMileageEntity.bmw_timestamp || currentMileageEntity.last_updated || new Date().toISOString(),
-      'BMW/HA'
+      currentMileageSource
     );
   }
 
@@ -550,52 +590,6 @@ async function handleGetData(env, cors) {
   let resolvedDailyKm = null;
   let resolvedDailyKmSource = null;
   let resolvedDailyKmTimestamp = null;
-  if (currentMileageEvent && beforeTodayEvent && currentMileageChangedAt && dateKeyInRome(currentMileageChangedAt) === todayRome) {
-    const d = currentMileageEvent.km - beforeTodayEvent.km;
-    if (d >= 0 && d < 1500) {
-      resolvedDailyKm = Math.round(d * 10) / 10;
-      resolvedDailyKmSource = currentMileageEvent.source || 'Odometro';
-      resolvedDailyKmTimestamp = currentMileageChangedAt;
-    }
-  }
-
-  // Fallback: infer today's km from BMW's "driving distance this month".
-  // This sensor often refreshes independently from the main vehicle mileage.
-  if (resolvedDailyKm === null) {
-    try {
-      const monthEntity = 'sensor.x3_m40d_driving_distance_this_month';
-      const monthRows = await db.prepare(
-        `SELECT snapshot_timestamp, state, bmw_timestamp
-         FROM bmw_raw_daily
-         WHERE entity_id = ?
-         ORDER BY snapshot_timestamp DESC LIMIT 200`
-      ).bind(monthEntity).all();
-      const samples = (monthRows.results || []).map(r => ({
-        ts: r.bmw_timestamp || r.snapshot_timestamp,
-        v: Number(String(r.state || '').replace(',','.'))
-      })).filter(x => Number.isFinite(x.v) && x.ts)
-        .sort((a,b) => new Date(a.ts) - new Date(b.ts));
-
-      const currentMonthState = current[monthEntity];
-      if (currentMonthState) {
-        const v = Number(String(currentMonthState.value || '').replace(',','.'));
-        const ts0 = currentMonthState.bmw_timestamp || currentMonthState.last_updated;
-        if (Number.isFinite(v) && ts0) samples.push({ts:ts0,v});
-      }
-
-      const before = samples.filter(x => dateKeyInRome(x.ts) < todayRome).slice(-1)[0] || null;
-      const today = samples.filter(x => dateKeyInRome(x.ts) === todayRome);
-      const latest = today.length ? today[today.length-1] : null;
-      if (before && latest) {
-        const d = latest.v - before.v;
-        if (d >= 0 && d < 1500) {
-          resolvedDailyKm = Math.round(d * 10) / 10;
-          resolvedDailyKmSource = 'BMW distanza mese';
-          resolvedDailyKmTimestamp = latest.ts;
-        }
-      }
-    } catch (_) {}
-  }
 
   const mileageAgeHours = currentMileageChangedAt
     ? Math.max(0, (Date.now() - new Date(currentMileageChangedAt).getTime()) / 3600000)
@@ -615,6 +609,28 @@ async function handleGetData(env, cors) {
     const prev = progress[progress.length - 2];
     const moved = last.km - prev.km;
     if (moved > 0 && moved < 1000) lastMovement = { distanceKm: Math.round(moved * 10) / 10, timestamp: last.timestamp, source: last.source, odometerKm: last.km };
+  }
+
+  // "Km oggi" = increments actually observed during today's Rome calendar day.
+  // Never bridge yesterday -> today: that can assign a late/unobserved previous-day
+  // drive to today (the previous implementation was doing exactly that).
+  const todayProgress = progress.filter(e => e.date === todayRome);
+  if (todayProgress.length >= 2) {
+    let total = 0;
+    for (let i = 1; i < todayProgress.length; i++) {
+      const d = todayProgress[i].km - todayProgress[i-1].km;
+      if (d > 0 && d < 500) total += d;
+    }
+    resolvedDailyKm = Math.round(total * 10) / 10;
+    const latestToday = todayProgress[todayProgress.length - 1];
+    resolvedDailyKmSource = latestToday.source || 'BMW CarData';
+    resolvedDailyKmTimestamp = latestToday.timestamp;
+  } else if (todayProgress.length === 1) {
+    // We have today's current odometer but no same-day baseline yet.
+    // Showing 0 or bridging from yesterday would both be misleading.
+    resolvedDailyKm = null;
+    resolvedDailyKmSource = todayProgress[0].source || 'BMW CarData';
+    resolvedDailyKmTimestamp = todayProgress[0].timestamp;
   }
 
   let milestone81000 = null;
@@ -749,6 +765,17 @@ async function handleGetData(env, cors) {
       }
     }
     if (!locationCoords) {
+      const lat = toNum(state('vehicle.cabin.infotainment.navigation.currentLocation.latitude'));
+      const lng = toNum(state('vehicle.cabin.infotainment.navigation.currentLocation.longitude'));
+      const heading = toNum(state('vehicle.cabin.infotainment.navigation.currentLocation.heading'));
+      if (lat !== null && lng !== null) {
+        locationCoords = { lat, lng, heading };
+        locationTimestamp =
+          ts('vehicle.cabin.infotainment.navigation.currentLocation.latitude') ||
+          ts('vehicle.cabin.infotainment.navigation.currentLocation.longitude');
+      }
+    }
+    if (!locationCoords) {
       const cdRow = await db.prepare('SELECT latitude, longitude, heading, c_timestamp FROM bmw_cardata_raw WHERE latitude IS NOT NULL ORDER BY c_timestamp DESC LIMIT 1').first();
       if (cdRow) {
         locationCoords = { lat: cdRow.latitude, lng: cdRow.longitude, heading: cdRow.heading || null };
@@ -756,6 +783,7 @@ async function handleGetData(env, cors) {
       }
     }
   } catch(_) {}
+  const locationLabel=await getLocationLabel(db, locationCoords);
   // Calculate distance this month from bmw_daily (more accurate than BMW entity)
   let distanceThisMonth = 0;
   try {
@@ -887,9 +915,9 @@ async function handleGetData(env, cors) {
       dailyKmBaseline: beforeTodayEvent ? beforeTodayEvent.km : null,
       consumptionL100: analytics.consumption.latest,
       ecoProPercent: ecoPro,
-      vehicleState: tripInProgress===true ? 'In viaggio' : (tripInProgress===null ? 'Stato viaggio n.d.' : normalizeLocation(locationState))
+      vehicleState: tripInProgress===true ? 'In viaggio' : ((locationLabel && locationLabel.label) || normalizeLocation(locationState))
     },
-    location: locationCoords ? { ...locationCoords, timestamp: locationTimestamp } : null,
+    location: locationCoords ? { ...locationCoords, timestamp: locationTimestamp, label: locationLabel?.label || null, displayName: locationLabel?.displayName || null } : null,
     lastMovement,
     milestone81000,
     refuels:{count:refuels.length,last:refuels.length?refuels[refuels.length-1]:null,recent:refuels.slice(-5).reverse()},
@@ -1618,8 +1646,8 @@ function serveTrips() {
       document.getElementById('statDays').textContent = activeDays + '/' + trips.length;
       document.getElementById('statAvg').textContent = activeDays > 0 ? Math.round(totalKm/activeDays) + ' km' : '\u2014';
       
-      var avgConsumption = totalKmWithFuel > 0 ? (totalLitresUsed / totalKmWithFuel * 100).toFixed(1) : null;
-      document.getElementById('statConsumption').textContent = avgConsumption ? avgConsumption + ' L/100km' : '\u2014';
+      var avgConsumption = totalLitresUsed > 0 ? (totalKmWithFuel / totalLitresUsed).toFixed(1) : null;
+      document.getElementById('statConsumption').textContent = avgConsumption ? avgConsumption + ' km/L' : '\u2014';
       document.getElementById('statConsumptionSub').textContent = totalLitresUsed > 0 ? Math.round(totalLitresUsed) + 'L su ' + Math.round(totalKmWithFuel) + ' km' : '';
       
       document.getElementById('statRefuels').textContent = refuels.length;
@@ -1668,7 +1696,8 @@ function serveTrips() {
         if (t._consumption !== null) {
           var c = parseFloat(t._consumption);
           var cls = c > 12 ? 'fuel-red' : c > 9 ? 'fuel-amber' : 'fuel-green';
-          consStr = '<span class="fuel-badge ' + cls + '">' + t._consumption + ' L/100</span>';
+          var kmL = Number(t._consumption)>0 ? (100/Number(t._consumption)).toFixed(1) : null;
+          consStr = kmL ? '<span class="fuel-badge ' + cls + '">' + kmL + ' km/L</span>' : '—';
         }
         
         // Km since refuel
@@ -1791,13 +1820,13 @@ function serveFuel() {
   <main class="shell">
     <div id="notice" class="notice" style="display:none"></div>
     <div class="stats">
-      <div class="stat"><small>Consumo medio</small><strong id="sAvg">\u2014</strong><div class="sub">L/100km</div></div>
+      <div class="stat"><small>Consumo medio</small><strong id="sAvg">\u2014</strong><div class="sub">km/L</div></div>
       <div class="stat"><small>Litri consumati</small><strong id="sLitres">\u2014</strong><div class="sub">totale periodo</div></div>
       <div class="stat"><small>Km per litro</small><strong id="sKmL">\u2014</strong><div class="sub">efficienza</div></div>
       <div class="stat"><small>Rifornimenti</small><strong id="sRefuels">\u2014</strong><div class="sub" id="sRefuelCost"></div></div>
     </div>
     <div class="chart-card">
-      <h3>Consumo giornaliero (L/100km)</h3>
+      <h3>Consumo giornaliero (km/L)</h3>
       <div class="chart-holder"><canvas id="chartConsumption"></canvas></div>
     </div>
     <div class="chart-card">
@@ -1861,8 +1890,8 @@ function serveFuel() {
     }
 
     // Stats
-    var avgL100=totalKmF>0?Math.round(totalL/totalKmF*1000)/10:null;
-    document.getElementById('sAvg').textContent=avgL100!==null?avgL100.toFixed(1):'\u2014';
+    var avgKmL=totalL>0?Math.round(totalKmF/totalL*10)/10:null;
+    document.getElementById('sAvg').textContent=avgKmL!==null?avgKmL.toFixed(1):'\u2014';
     document.getElementById('sLitres').textContent=totalL>0?Math.round(totalL)+' L':'\u2014';
     document.getElementById('sKmL').textContent=totalL>0?(totalKmF/totalL).toFixed(1):'\u2014';
     document.getElementById('sRefuels').textContent=refuels.length;
@@ -1874,7 +1903,7 @@ function serveFuel() {
       var ctx1=document.getElementById('chartConsumption').getContext('2d');
       new Chart(ctx1,{type:'bar',data:{
         labels:cPoints.map(function(p){var d=new Date(p.date+'T12:00:00');return d.getDate()+' '+months[d.getMonth()]}),
-        datasets:[{label:'L/100km',data:cPoints.map(function(p){return p.value}),
+        datasets:[{label:'km/L',data:cPoints.map(function(p){return p.value>0?Math.round((100/p.value)*10)/10:null}),
           backgroundColor:cPoints.map(function(p){return p.value<9?'rgba(46,165,92,.8)':p.value<12?'rgba(229,165,10,.8)':'rgba(229,69,69,.8)'}),
           borderRadius:5}]
       },options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{
@@ -2553,7 +2582,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 
     <section class="quick-stats" aria-label="Riepilogo rapido">
       <article class="quick-card"><span class="quick-icon">🛣️</span><div><small>Km oggi</small><strong id="quickKm">—</strong><em id="quickKmNote">ultimo intervallo giornaliero</em></div></article>
-      <article class="quick-card"><span class="quick-icon">⛽</span><div><small>Consumo stimato</small><strong id="quickConsumption">—</strong><em id="quickConsumptionNote">L/100km stimati</em></div></article>
+      <article class="quick-card"><span class="quick-icon">⛽</span><div><small>Consumo stimato</small><strong id="quickConsumption">—</strong><em id="quickConsumptionNote">km/L stimati</em></div></article>
       <article class="quick-card"><span class="quick-icon">🌿</span><div><small>ECO Pro</small><strong id="quickEco">—</strong><em>ultimo trip BMW</em></div></article>
       <article class="quick-card"><span class="quick-icon">💰</span><div><small>Costo/km</small><strong id="quickCostKm">—</strong><em id="quickCostNote">€ al km stimato</em></div></article>
       <article class="quick-card"><span class="quick-icon">🅿️</span><div><small>Stato</small><strong id="quickStatus">—</strong><em id="quickStatusNote">stato corrente</em></div></article>
@@ -3022,7 +3051,7 @@ function renderQuickStats(d){
     var src=d.quick.dailyKmSource?(' · '+d.quick.dailyKmSource):'';
     $('quickKmNote').textContent='distanza odierna'+src;
   }
-  $('quickConsumption').textContent=d.quick.consumptionL100===null?'—':fmt1(d.quick.consumptionL100)+' L/100';
+  $('quickConsumption').textContent=(d.quick.consumptionL100===null||!(d.quick.consumptionL100>0))?'—':fmt1(100/d.quick.consumptionL100)+' km/L';
   if (d.analytics && d.analytics.consumption && d.analytics.consumption.points && d.analytics.consumption.points.length > 0) {
     const avgC = d.analytics.consumption.average, q=d.consumptionQuality||{};
     $('quickConsumptionNote').textContent = avgC ? 'stima · affidabilità '+(q.confidence||'bassa')+' · '+(q.coveredKm||0)+' km coperti' : 'stima ultimo intervallo';
@@ -3038,7 +3067,7 @@ function renderQuickStats(d){
   } else {
     $('heroCostMonth').textContent='';
   }
-  $('quickStatusNote').textContent=d.trip.inProgress===null?'dato viaggio non disponibile':(d.trip.inProgress?'trip BMW in corso':'stato corrente');
+  $('quickStatusNote').textContent=d.trip.inProgress?'trip BMW in corso':(d.location&&d.location.label?'posizione BMW CarData':'ultima posizione disponibile');
 }
 
 function renderAnalytics(a){
@@ -3055,7 +3084,7 @@ function renderAnalytics(a){
   $('consumptionAvg').textContent=cOk?\`\${fmt1(a.consumption.average)} L/100km\`:'—';
   toggleEmpty('consumptionChart','consumptionEmpty',!cOk);
   if(cOk){
-    makeChart('consumptionChart','line',a.consumption.points.map(p=>shortDate(p.timestamp)),[{label:'L/100km',data:a.consumption.points.map(p=>p.value),borderColor:'#64e78b',backgroundColor:'rgba(100,231,139,.12)',fill:true,tension:.32,pointRadius:3}],baseChartOptions(false));
+    makeChart('consumptionChart','line',a.consumption.points.map(p=>shortDate(p.timestamp)),[{label:'km/L',data:a.consumption.points.map(p=>p.value>0?Math.round((100/p.value)*10)/10:null),borderColor:'#64e78b',backgroundColor:'rgba(100,231,139,.12)',fill:true,tension:.32,pointRadius:3}],baseChartOptions(false));
   }else destroyChart('consumptionChart');
 }
 
