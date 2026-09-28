@@ -7,3 +7,6 @@ keep_vars = true
 binding = "DB"
 database_name = "bmw-vehicle-data"
 database_id = ""
+
+[triggers]
+crons = ["17 */4 * * *"]
