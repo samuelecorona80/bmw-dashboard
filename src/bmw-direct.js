@@ -159,6 +159,21 @@ async function apiGet(env, path, accessToken) {
   if (!response.ok) throw new Error('BMW_API_' + response.status + ':' + (data?.errorId || data?.error || 'request_failed'));
   return data;
 }
+
+async function discoverContainerId(env, accessToken) {
+  if (env.BMW_CONTAINER_ID) return {id:env.BMW_CONTAINER_ID, source:'env'};
+  const payload = await apiGet(env, '/customers/containers', accessToken);
+  const containers = Array.isArray(payload) ? payload : (Array.isArray(payload?.containers) ? payload.containers : []);
+  const candidates = containers.filter(x => x && typeof x.containerId === 'string');
+  if (!candidates.length) return {id:null, source:'none', count:0};
+
+  const preferred = candidates.find(x =>
+    x.purpose === 'High voltage battery telemetry' ||
+    x.name === 'BMW CarData HV Battery'
+  );
+  const chosen = preferred || candidates[candidates.length - 1];
+  return {id:chosen.containerId, source:preferred ? 'bavariandata_named' : 'existing_latest', count:candidates.length};
+}
 async function saveRaw(env, kind, vin, payload) {
   await env.DB.prepare(
     'INSERT INTO bmw_direct_raw (fetched_at, kind, vin, payload_json) VALUES (?, ?, ?, ?)'
@@ -275,13 +290,25 @@ export async function runBmwDirectFetch(env, {force=false} = {}) {
     const basic = await apiGet(env, '/customers/vehicles/' + encodeURIComponent(vin) + '/basicData', token);
     await saveRaw(env, 'basicData', vin, basic);
     const kinds = ['mappings','basicData'];
-    if (env.BMW_CONTAINER_ID) {
-      const telematic = await apiGet(env, '/customers/vehicles/' + encodeURIComponent(vin) + '/telematicData?containerId=' + encodeURIComponent(env.BMW_CONTAINER_ID), token);
+    const container = await discoverContainerId(env, token);
+    if (container.id) {
+      const telematic = await apiGet(
+        env,
+        '/customers/vehicles/' + encodeURIComponent(vin) + '/telematicData?containerId=' + encodeURIComponent(container.id),
+        token
+      );
       await saveRaw(env, 'telematicData', vin, telematic);
       kinds.push('telematicData');
     }
     await saveState(env, {last_fetch_at:now,last_fetch_status:kinds.join('+'),last_error:null,updated_at:now});
-    return {ok:true,fetchedAt:now,kinds,telematicConfigured:Boolean(env.BMW_CONTAINER_ID)};
+    return {
+      ok:true,
+      fetchedAt:now,
+      kinds,
+      telematicConfigured:Boolean(container.id),
+      containerSource:container.source,
+      containerCount:container.count ?? null
+    };
   } catch (err) {
     const message = err?.message || String(err);
     await saveState(env, {last_fetch_at:now,last_fetch_status:'error',last_error:message,updated_at:now});
