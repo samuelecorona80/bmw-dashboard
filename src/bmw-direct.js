@@ -301,6 +301,53 @@ async function ingestDirectTelematic(env, vin, payload, fetchedAt) {
   return {descriptorCount:Object.keys(data).length, newestTimestamp:newestTs};
 }
 
+async function recomputeObservedDailyDistance(env, fetchedAt) {
+  try {
+    const today = romeDateKey(fetchedAt);
+    const rows = await env.DB.prepare(
+      "SELECT snapshot_timestamp, state, bmw_timestamp, trigger_reason, attributes_json FROM bmw_raw_daily WHERE entity_id='sensor.x3_m40d_vehicle_mileage' ORDER BY snapshot_timestamp DESC LIMIT 500"
+    ).all();
+    const samples = (rows.results || []).map(r => {
+      const ts = r.bmw_timestamp || r.snapshot_timestamp;
+      const km = Number(String(r.state || '').replace(',','.'));
+      let direct = r.trigger_reason === 'cloudflare_direct';
+      try {
+        const a = r.attributes_json ? JSON.parse(r.attributes_json) : {};
+        if (a && a.source === 'cloudflare_direct') direct = true;
+      } catch (_) {}
+      return {ts, km, direct};
+    }).filter(x => x.ts && Number.isFinite(x.km) && romeDateKey(x.ts) === today)
+      .sort((a,b) => Date.parse(a.ts) - Date.parse(b.ts));
+
+    const progress = [];
+    let max = null;
+    for (const s of samples) {
+      if (max === null || s.km > max + 0.01) {
+        max = s.km;
+        progress.push(s);
+      }
+    }
+    if (progress.length < 2) return {updated:false, reason:'insufficient_same_day_progress'};
+
+    let distance = 0;
+    for (let i=1;i<progress.length;i++) {
+      const d = progress[i].km - progress[i-1].km;
+      if (d > 0 && d < 500) distance += d;
+    }
+    distance = Math.round(distance * 10) / 10;
+    const startKm = progress[0].km;
+    const endKm = progress[progress.length-1].km;
+    const latestTs = progress[progress.length-1].ts;
+
+    await env.DB.prepare(
+      'UPDATE bmw_daily SET mileage_start_km=?, mileage_km=?, daily_distance_km=?, snapshot_timestamp=?, updated_at=datetime("now") WHERE snapshot_date=?'
+    ).bind(startKm,endKm,distance,fetchedAt,today).run();
+    return {updated:true,distanceKm:distance,startKm,endKm,latestTs};
+  } catch (err) {
+    return {updated:false,reason:err?.message||String(err)};
+  }
+}
+
 async function saveRaw(env, kind, vin, payload) {
   await env.DB.prepare(
     'INSERT INTO bmw_direct_raw (fetched_at, kind, vin, payload_json) VALUES (?, ?, ?, ?)'
@@ -426,8 +473,10 @@ export async function runBmwDirectFetch(env, {force=false} = {}) {
       );
       await saveRaw(env, 'telematicData', vin, telematic);
       const ingestion = await ingestDirectTelematic(env, vin, telematic, now);
+      const dayDistance = await recomputeObservedDailyDistance(env, now);
       kinds.push('telematicData');
       kinds.push('current:' + ingestion.descriptorCount);
+      if (dayDistance.updated) kinds.push('todayKm:' + dayDistance.distanceKm);
     }
     await saveState(env, {last_fetch_at:now,last_fetch_status:kinds.join('+'),last_error:null,updated_at:now});
     return {
