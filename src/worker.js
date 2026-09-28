@@ -585,12 +585,12 @@ async function handleGetData(env, cors) {
   };
   const anomalies=[];
   if(freshness.odometer.status==='old') anomalies.push({severity:'warn',text:'Odometro non aggiornato da oltre 24 ore',timestamp:freshness.odometer.timestamp});
-  if(freshness.battery.status==='old') anomalies.push({severity:'warn',text:'Stato batteria 12V non recente',timestamp:freshness.battery.timestamp});
-  if(freshness.security.status==='old') anomalies.push({severity:'warn',text:'Stato chiusura vettura non recente',timestamp:freshness.security.timestamp});
+  if(freshness.battery.status==='old') anomalies.push({severity:'info',text:'Stato batteria 12V non recente',timestamp:freshness.battery.timestamp});
+  if(freshness.security.status==='old') anomalies.push({severity:'info',text:'Stato chiusura vettura non recente',timestamp:freshness.security.timestamp});
   if(tyres.trendAlerts?.any) anomalies.push({severity:'warn',text:'Variazione pressione ≥0,2 bar rilevata',timestamp:tyres.bmwTimestamp});
   if(tyres.alerts?.any) anomalies.push({severity:'alert',text:'Pressione pneumatici fuori target',timestamp:tyres.bmwTimestamp});
   if(String(state('sensor.x3_m40d_doors_overall_state')||'').toUpperCase()==='UNLOCKED' && freshness.security.status!=='old' && freshness.security.status!=='unknown') anomalies.push({severity:'alert',text:'Vettura sbloccata',timestamp:lockFreshTs});
-  const severityOrder={alert:0,warn:1,ok:2};
+  const severityOrder={alert:0,warn:1,info:2,ok:3};
   anomalies.sort((a,b)=>(severityOrder[a.severity]??9)-(severityOrder[b.severity]??9));
   if(!anomalies.length) anomalies.push({severity:'ok',text:'Nessuna anomalia recente rilevata'});
 
@@ -1101,7 +1101,7 @@ function serveVehicleInfo() {
         <h2>BMW X3 M40d</h2>
         <p>G01 \u00b7 Sports Activity Vehicle \u00b7 2019</p>
         <div class="hero-spec">
-          <div><span>VIN</span><br><strong>WBATX91030LP62133</strong></div>
+          <div><span>VIN</span><br><strong>WBATX9••••••62133</strong></div>
           <div><span>Produzione</span><br><strong>13 settembre 2019</strong></div>
           <div><span>Motore</span><br><strong>B57T \u2014 6 cil. diesel biturbo</strong></div>
           <div><span>Cambio</span><br><strong>Sport Automatic</strong></div>
@@ -1218,7 +1218,7 @@ function serveVehicleInfo() {
     </div>
 
     <div style="text-align:center;padding:32px 0;color:var(--muted);font-size:12px">
-      Dati estratti da mdecoder.com \u00b7 VIN WBATX91030LP62133
+      Dati estratti da mdecoder.com \u00b7 VIN WBATX9••••••62133
     </div>
   </main>
 </body>
@@ -2180,7 +2180,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <title>BMW X3 M40d · My Vehicle Dashboard</title>
+  <title>BMW X3 M40d · Dashboard personale</title>
   <style>
 :root{--bg:#07111d;--bg2:#091827;--card:rgba(12,27,45,.88);--line:#274766;--text:#f4f7fb;--muted:#9fb2c7;--blue:#3f8cff;--green:#64e78b;--amber:#ffc65b;--red:#ff6b6b}
 *{box-sizing:border-box}html,body{margin:0;min-height:100%;background:radial-gradient(circle at 15% 10%,#163152 0,transparent 32%),radial-gradient(circle at 90% 4%,#0e3154 0,transparent 30%),linear-gradient(180deg,var(--bg2),var(--bg));color:var(--text);font-family:Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif}body{overflow-x:hidden}
@@ -2280,6 +2280,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
           <p>Stato, percorrenza, consumi e manutenzione in un’unica vista.</p>
           <div class="hero-pills">
             <span class="pill" id="homePill">● Stato vettura</span>
+            <span class="pill" id="dataHealth">◌ Stato dati</span>
             <span class="pill" id="tripBadge" style="display:none;background:var(--amber);color:#000;animation:pulse 1.5s infinite">🏎️ In viaggio</span>
             <span class="pill">Aggiornamento giornaliero</span>
              <a href="/vehicle-info" class="pill" style="text-decoration:none;background:rgba(67,142,255,.2);color:var(--accent)">📋 Scheda veicolo</a>
@@ -2428,7 +2429,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
         <div class="card-kicker">⚙️ Info veicolo</div>
         <div style="margin-top:12px;display:grid;gap:8px;font-size:14px">
           <div style="display:flex;justify-content:space-between"><span style="color:var(--muted)">Modello</span><span>BMW X3 M40d (G01)</span></div>
-          <div style="display:flex;justify-content:space-between"><span style="color:var(--muted)">VIN</span><span style="font-family:monospace;font-size:12px">WBATX91030LP62133</span></div>
+          <div style="display:flex;justify-content:space-between"><span style="color:var(--muted)">VIN</span><span style="font-family:monospace;font-size:12px">WBATX9••••••62133</span></div>
           <div style="display:flex;justify-content:space-between"><span style="color:var(--muted)">Motore</span><span>B57T (Diesel)</span></div>
           <div style="display:flex;justify-content:space-between"><span style="color:var(--muted)">Colore</span><span>Alpinweiss III</span></div>
           <div style="display:flex;justify-content:space-between"><span style="color:var(--muted)">Costruzione</span><span>13/09/2019</span></div>
@@ -2584,6 +2585,15 @@ function renderDashboard(d){
   $('freshness').className='freshness '+(odFresh.status||'unknown');
   $('freshness').innerHTML='<i></i>'+escapeHtml('Odometro · '+ageLabel(mileageTs).replace('Dato BMW appena aggiornato','appena aggiornato').replace('Dato BMW: ',''));
   $('homePill').textContent=\`● \${locationLabel(d.core.locationState)}\`;
+  if($('dataHealth')){
+    var fs=d.freshness||{}, vals=Object.values(fs), total=vals.length;
+    var recent=vals.filter(function(x){return x&&x.status==='fresh';}).length;
+    var usable=vals.filter(function(x){return x&&x.status!=='old'&&x.status!=='unknown';}).length;
+    var stateColor=recent===total?'var(--green)':(usable>=Math.ceil(total/2)?'var(--amber)':'var(--red)');
+    $('dataHealth').textContent='● '+recent+'/'+total+' fonti fresche';
+    $('dataHealth').style.color=stateColor;
+    $('dataHealth').style.borderColor=stateColor;
+  }
   // Status banner rendering
   var lkV = (d.security.lockState || '').toUpperCase();
   var lockKnown = ['LOCKED','SECURED','UNLOCKED'].includes(lkV);
@@ -2675,7 +2685,7 @@ function renderDashboard(d){
   }
   if($('anomalyList')) $('anomalyList').innerHTML=(d.anomalies||[]).map(function(a){
     var icon=a.severity==='ok'?'✓':(a.severity==='alert'?'!':'⚠');
-    var cls=a.severity==='alert'?'old':(a.severity==='warn'?'stale':'fresh');
+    var cls=a.severity==='alert'?'old':(a.severity==='warn'?'stale':(a.severity==='info'?'unknown':'fresh'));
     var when=a.timestamp?' · '+ageLabel(a.timestamp).replace('Dato BMW: ','').replace('Dato BMW appena aggiornato','adesso'):'';
     return '<div style="margin:6px 0"><span class="fresh-chip '+cls+'">'+icon+' '+escapeHtml(a.text)+escapeHtml(when)+'</span></div>';
   }).join('');
@@ -2696,7 +2706,7 @@ function renderDashboard(d){
   $('preconditionDetail').textContent=String(d.climate.errorReason||'').toLowerCase()==='ok'?'Nessun errore':(d.climate.errorReason?\`Stato: \${d.climate.errorReason}\`:'—');
   $('locationState').textContent=locationLabel(d.core.locationState);
   if(d.location && d.location.lat && d.location.lng) {
-    $('locationCoords').innerHTML='📍 '+d.location.lat.toFixed(4)+'°N, '+d.location.lng.toFixed(4)+'°E'+(d.location.timestamp?' · '+escapeHtml(ageLabel(d.location.timestamp)):'');
+    $('locationCoords').innerHTML='Posizione disponibile'+(d.location.timestamp?' · '+escapeHtml(ageLabel(d.location.timestamp)):'')+' · <a href="/locations" style="color:var(--blue);text-decoration:none">vedi dettagli</a>';
   } else {
     $('locationCoords').textContent='Solo zona, coordinate non disponibili';
   }
@@ -2874,7 +2884,15 @@ function toggleEmpty(canvasId,emptyId,isEmpty){ $(canvasId).classList.toggle('hi
 function destroyChart(id){ if(charts[id]){charts[id].destroy();delete charts[id];} }
 function makeChart(id,type,labels,datasets,opts){ destroyChart(id); const ctx=$(id); if(!ctx)return; charts[id]=new Chart(ctx,{type,data:{labels,datasets},options:opts}); }
 
-window.addEventListener('load',()=>{ initPeriodSelectors(); loadDashboard(false); setInterval(()=>loadDashboard(false),5*60*1000); });
+let dashboardRefreshTimer=null;
+window.addEventListener('load',()=>{
+  initPeriodSelectors();
+  loadDashboard(false);
+  dashboardRefreshTimer=setInterval(()=>{ if(!document.hidden) loadDashboard(false); },5*60*1000);
+});
+document.addEventListener('visibilitychange',()=>{
+  if(!document.hidden) loadDashboard(false);
+});
 
 
 /* ===== Analytics Period Selector ===== */
@@ -2916,7 +2934,7 @@ function selectMonthYear(){
 
 function renderDrivingAnalytics(a) {
   if (!a || a.error) {
-    document.getElementById('drivingSection').innerHTML = '<div class="mini-note">' + (a ? a.error : 'No data') + '</div>';
+    document.getElementById('drivingSection').innerHTML = '<div class="mini-note">' + (a ? a.error : 'Nessun dato') + '</div>';
     return;
   }
   const m = a.mileage, d = a.driving, f = a.fuel, t = a.trips;
@@ -2926,7 +2944,7 @@ function renderDrivingAnalytics(a) {
   // Period label — show data availability
   var periodInfo = a.periodStart + ' → ' + a.periodEnd + ' (' + a.calendarDays + 'd)';
   if (a.dataStart && a.dataStart > a.periodStart) {
-    periodInfo += '  ·  data from ' + shortDate(a.dataStart);
+    periodInfo += '  ·  dati da ' + shortDate(a.dataStart);
   }
   $('periodLabel').textContent = periodInfo;
 
@@ -2935,9 +2953,9 @@ function renderDrivingAnalytics(a) {
   $('distanceKm').textContent = fmtInt(m.distanceKm);
   $('avgKmDay').textContent = fmt1(d.avgKmPerDay);
   $('avgKmActive').textContent = fmt1(d.avgKmPerDrivingDay);
-  $('activeLabel').textContent = d.drivingDaysComplete ? 'km/active day' : 'km/giorno attivo osservato';
+  $('activeLabel').textContent = d.drivingDaysComplete ? 'km/giorno attivo' : 'km/giorno attivo osservato';
   $('drivingDaysVal').textContent = d.observedDrivingDays;
-  $('drivingDaysCov').textContent = d.drivingDaysComplete ? '' : 'Partial coverage';
+  $('drivingDaysCov').textContent = d.drivingDaysComplete ? '' : 'Copertura parziale';
   $('drivingDaysCov').classList.toggle('hidden', d.drivingDaysComplete);
   $('longestDayVal').textContent = d.longestDay.km > 0 ? fmtInt(d.longestDay.km) + ' km (' + shortDate(d.longestDay.date) + ')' : '—';
 
@@ -2971,13 +2989,13 @@ function renderFuelCard(f) {
 
   if (f.consumptionConfidence === 'insufficient') {
     fuelVal.textContent = '—';
-    fuelBadge.textContent = 'Not enough data';
+    fuelBadge.textContent = 'Dati insufficienti';
     fuelBadge.className = 'badge insufficient';
-    fuelCov.textContent = fmtInt(f.fuelCoveredKm) + ' km / ' + fmt1(f.fuelConsumedL) + ' L observed';
+    fuelCov.textContent = fmtInt(f.fuelCoveredKm) + ' km / ' + fmt1(f.fuelConsumedL) + ' L osservati';
     fuelCov.classList.remove('hidden');
   } else if (f.consumptionConfidence === 'provisional') {
     fuelVal.textContent = fmt1(f.kmPerLitre);
-    fuelBadge.textContent = 'Provisional';
+    fuelBadge.textContent = 'Provvisorio';
     fuelBadge.className = 'badge provisional';
     fuelCov.textContent = fmtInt(f.fuelCoveredKm) + ' km / ' + fmt1(f.fuelConsumedL) + ' L';
     fuelCov.classList.remove('hidden');
@@ -3048,7 +3066,7 @@ function renderDailyKmChart(a) {
   }], {
     responsive: true,
     maintainAspectRatio: false,
-    plugins: { legend: { display: false }, tooltip: { callbacks: { label: function(ctx) { return ctx.raw !== null ? ctx.raw + ' km' : 'No data'; } } } },
+    plugins: { legend: { display: false }, tooltip: { callbacks: { label: function(ctx) { return ctx.raw !== null ? ctx.raw + ' km' : 'Nessun dato'; } } } },
     scales: {
       x: { grid: { display: false }, ticks: { color: '#9fb2c7', font: { size: 10 }, maxRotation: 45, autoSkip: true, maxTicksLimit: 15 } },
       y: { beginAtZero: true, grid: { color: 'rgba(39,71,102,.3)' }, ticks: { color: '#9fb2c7', font: { size: 10 } } }
