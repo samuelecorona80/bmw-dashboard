@@ -288,3 +288,69 @@ export async function runBmwDirectFetch(env, {force=false} = {}) {
     return {ok:false,error:message};
   }
 }
+
+
+export function serveBmwDirectPage() {
+  return new Response(`<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>BMW Direct · Setup</title>
+<style>
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#07111d;color:#f4f7fb;margin:0;padding:24px}
+main{max-width:760px;margin:auto}.card{background:#102239;border:1px solid #31506d;border-radius:18px;padding:20px;margin:16px 0}
+button{background:#4b98ff;color:#fff;border:0;border-radius:10px;padding:12px 16px;font-weight:700;margin:6px 6px 6px 0;cursor:pointer}
+pre{white-space:pre-wrap;word-break:break-word;background:#091827;padding:14px;border-radius:10px;color:#cfe1f5}
+a{color:#7eb5ff}.muted{color:#9fb2c7}.ok{color:#78e39b}.bad{color:#ff9a9a}
+</style></head>
+<body><main>
+<h1>BMW CarData diretto</h1>
+<p class="muted">Configurazione Cloudflare → BMW CarData. Nessun token viene mostrato in questa pagina.</p>
+<div class="card">
+  <h3>1. Stato</h3>
+  <button onclick="status()">Aggiorna stato</button>
+  <pre id="status">Caricamento…</pre>
+</div>
+<div class="card">
+  <h3>2. Autorizzazione BMW</h3>
+  <button onclick="startAuth()">Avvia Device Code Flow</button>
+  <div id="auth" class="muted">Non avviato.</div>
+  <button onclick="pollAuth()">Ho autorizzato · verifica</button>
+</div>
+<div class="card">
+  <h3>3. Test REST diretto</h3>
+  <button onclick="fetchNow()">Esegui fetch BMW</button>
+  <pre id="fetch">Non eseguito.</pre>
+</div>
+<p><a href="/">← Dashboard</a></p>
+<script>
+async function api(path,method='GET'){
+  const r=await fetch(path,{method,headers:{'Accept':'application/json'}});
+  const j=await r.json().catch(()=>({error:'invalid_json'}));
+  return {ok:r.ok,status:r.status,j};
+}
+async function status(){
+  const x=await api('/api/bmw-direct/status');
+  document.getElementById('status').textContent=JSON.stringify(x.j,null,2);
+}
+async function startAuth(){
+  const x=await api('/api/bmw-direct/device/start','POST');
+  const el=document.getElementById('auth');
+  if(!x.ok){el.innerHTML='<span class="bad">'+JSON.stringify(x.j)+'</span>';return;}
+  const u=x.j.verificationUri||'#';
+  el.innerHTML='Apri <a target="_blank" rel="noopener" href="'+u+'">BMW authorization</a> e inserisci il codice <b>'+x.j.userCode+'</b>. Poi torna qui e clicca “Ho autorizzato · verifica”.';
+  status();
+}
+async function pollAuth(){
+  const x=await api('/api/bmw-direct/device/poll','POST');
+  document.getElementById('auth').innerHTML=x.ok?'<span class="ok">Autorizzazione completata.</span>':'<span class="muted">'+JSON.stringify(x.j)+'</span>';
+  status();
+}
+async function fetchNow(){
+  const x=await api('/api/bmw-direct/fetch','POST');
+  document.getElementById('fetch').textContent=JSON.stringify(x.j,null,2);
+  status();
+}
+status();
+</script></main></body></html>`,{headers:{'Content-Type':'text/html; charset=utf-8','Cache-Control':'no-store'}});
+}
