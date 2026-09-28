@@ -664,6 +664,7 @@ a{color:#7eb5ff}.muted{color:#9fb2c7}.ok{color:#78e39b}.bad{color:#ff9a9a}
 <div class="card">
   <h3>1. Stato</h3>
   <button onclick="status()">Aggiorna stato</button>
+  <button onclick="copyPre('status',this)">Copia stato</button>
   <pre id="status">Caricamento…</pre>
 </div>
 <div class="card">
@@ -679,6 +680,7 @@ a{color:#7eb5ff}.muted{color:#9fb2c7}.ok{color:#78e39b}.bad{color:#ff9a9a}
 <div class="card">
   <h3>3. Test REST diretto</h3>
   <button onclick="fetchNow()">Esegui fetch BMW</button>
+  <button onclick="copyPre('fetch',this)">Copia fetch</button>
   <pre id="fetch">Non eseguito.</pre>
 </div>
 <p><a href="/">← Dashboard</a></p>
@@ -687,6 +689,27 @@ async function api(path,method='GET'){
   const r=await fetch(path,{method,headers:{'Accept':'application/json'}});
   const j=await r.json().catch(()=>({error:'invalid_json'}));
   return {ok:r.ok,status:r.status,j};
+}
+async function copyPre(id,button){
+  const el=document.getElementById(id);
+  const text=el ? el.textContent : '';
+  if(!text) return;
+  const original=button.textContent;
+  try{
+    await navigator.clipboard.writeText(text);
+    button.textContent='Copiato ✓';
+  }catch(_){
+    const ta=document.createElement('textarea');
+    ta.value=text;
+    ta.style.position='fixed';
+    ta.style.opacity='0';
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand('copy');
+    ta.remove();
+    button.textContent='Copiato ✓';
+  }
+  setTimeout(()=>button.textContent=original,1400);
 }
 async function status(){
   const x=await api('/api/bmw-direct/status');
