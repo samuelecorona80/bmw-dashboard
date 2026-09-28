@@ -8,6 +8,37 @@ const FUEL_TANK_CAPACITY_L = 62;
 const DIESEL_PRICE_EUR = 2.294; // €/L self service - aggiornare periodicamente
 const DIESEL_PRICE_DATE = '2026-09-18';
 
+function unauthorizedResponse() {
+  return new Response('Autenticazione richiesta', {
+    status: 401,
+    headers: {
+      'WWW-Authenticate': 'Basic realm="BMW Dashboard", charset="UTF-8"',
+      'Cache-Control': 'no-store'
+    }
+  });
+}
+
+function hasValidBasicAuth(request, env) {
+  const expectedUser = env.SITE_USER || 'samuele';
+  const expectedPassword = env.SITE_PASSWORD;
+  // Keep the site reachable until the secret is configured; once present,
+  // every browser/API GET is protected.
+  if (!expectedPassword) return true;
+
+  const header = request.headers.get('Authorization') || '';
+  if (!header.startsWith('Basic ')) return false;
+  try {
+    const decoded = atob(header.slice(6));
+    const sep = decoded.indexOf(':');
+    if (sep < 0) return false;
+    const user = decoded.slice(0, sep);
+    const pass = decoded.slice(sep + 1);
+    return user === expectedUser && pass === expectedPassword;
+  } catch (_) {
+    return false;
+  }
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -17,6 +48,12 @@ export default {
       'Access-Control-Allow-Headers': 'Content-Type',
     };
     if (request.method === 'OPTIONS') return new Response(null, { headers: cors });
+
+    // Protect all browser/API reads. POST ingestion stays reachable so BMW
+    // telemetry can continue to populate D1 without browser credentials.
+    if (request.method !== 'POST' && !hasValidBasicAuth(request, env)) {
+      return unauthorizedResponse();
+    }
 
     try {
       if (request.method === 'POST') {
