@@ -359,6 +359,24 @@ async function recomputeObservedDailyDistance(env, fetchedAt) {
   }
 }
 
+async function getMappingsWithAuthRecovery(env, accessToken) {
+  try {
+    return {data: await apiGet(env, '/customers/vehicles/mappings', accessToken), recovered:false};
+  } catch (err) {
+    const msg = err?.message || String(err);
+    if (!/^BMW_API_(401|403):\/customers\/vehicles\/mappings:/.test(msg)) throw err;
+
+    // A token can be revoked before its exp timestamp (for example after another
+    // authorization flow for the same BMW client). Refresh once, then retry.
+    const state = await getState(env);
+    if (!state?.token_blob) throw err;
+    const tokens = await openSeal(env, state.token_blob);
+    const refreshed = await refreshTokens(env, state, tokens);
+    const data = await apiGet(env, '/customers/vehicles/mappings', refreshed.access_token);
+    return {data, recovered:true};
+  }
+}
+
 async function saveRaw(env, kind, vin, payload) {
   await env.DB.prepare(
     'INSERT INTO bmw_direct_raw (fetched_at, kind, vin, payload_json) VALUES (?, ?, ?, ?)'
@@ -468,9 +486,11 @@ export async function runBmwDirectFetch(env, {force=false} = {}) {
   }
   const now = new Date().toISOString();
   try {
-    const token = await validAccessToken(env);
+    let token = await validAccessToken(env);
     const vin = env.BMW_VIN;
-    const mappings = await apiGet(env, '/customers/vehicles/mappings', token);
+    const mappingResult = await getMappingsWithAuthRecovery(env, token);
+    const mappings = mappingResult.data;
+    if (mappingResult.recovered) token = await validAccessToken(env);
     await saveRaw(env, 'mappings', vin, mappings);
     const basic = await apiGet(env, '/customers/vehicles/' + encodeURIComponent(vin) + '/basicData', token);
     await saveRaw(env, 'basicData', vin, basic);
