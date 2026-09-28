@@ -158,6 +158,7 @@ async function apiGet(env, path, accessToken) {
   try { data = text ? JSON.parse(text) : {}; } catch (_) { data = {raw:text}; }
   if (!response.ok) {
     const detail =
+      data?.exveErrorId && data?.exveErrorMsg ? (data.exveErrorId + ': ' + data.exveErrorMsg) :
       data?.errorId ||
       data?.error ||
       data?.message ||
