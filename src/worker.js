@@ -8,40 +8,153 @@ const FUEL_TANK_CAPACITY_L = 62;
 const DIESEL_PRICE_EUR = 2.294; // €/L self service - aggiornare periodicamente
 const DIESEL_PRICE_DATE = '2026-09-18';
 
-function unauthorizedResponse() {
-  return new Response('Autenticazione richiesta', {
-    status: 401,
-    headers: {
-      'WWW-Authenticate': 'Basic realm="BMW Dashboard", charset="UTF-8"',
-      'Cache-Control': 'no-store'
-    }
-  });
+const AUTH_COOKIE = 'bmw_session';
+
+function b64urlEncodeBytes(bytes) {
+  let s = '';
+  for (const b of new Uint8Array(bytes)) s += String.fromCharCode(b);
+  return btoa(s).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
 }
 
-function hasValidBasicAuth(request, env) {
-  const expectedUser = env.SITE_USER || 'samuele';
-  const expectedPassword = env.SITE_PASSWORD;
-  // Keep the site reachable until the secret is configured; once present,
-  // every browser/API GET is protected.
-  if (!expectedPassword) return true;
+function b64urlDecodeBytes(value) {
+  const s = value.replace(/-/g,'+').replace(/_/g,'/');
+  const padded = s + '='.repeat((4 - s.length % 4) % 4);
+  const raw = atob(padded);
+  return Uint8Array.from(raw, ch => ch.charCodeAt(0));
+}
 
-  const header = request.headers.get('Authorization') || '';
-  if (!header.startsWith('Basic ')) return false;
+function cookieValue(request, name) {
+  const header = request.headers.get('Cookie') || '';
+  for (const part of header.split(';')) {
+    const i = part.indexOf('=');
+    if (i < 0) continue;
+    if (part.slice(0,i).trim() === name) return part.slice(i+1).trim();
+  }
+  return null;
+}
+
+async function authKey(env) {
+  const secret = env.SITE_PASSWORD;
+  if (!secret) return null;
+  return crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode('bmw-dashboard-session-v1|' + secret),
+    {name:'HMAC',hash:'SHA-256'},
+    false,
+    ['sign','verify']
+  );
+}
+
+async function createSessionToken(env, user, remember) {
+  const key = await authKey(env);
+  if (!key) return null;
+  const ttl = remember ? 30 * 86400 : 12 * 3600;
+  const payload = user + '|' + Math.floor(Date.now()/1000 + ttl);
+  const payloadBytes = new TextEncoder().encode(payload);
+  const sig = await crypto.subtle.sign('HMAC', key, payloadBytes);
+  return b64urlEncodeBytes(payloadBytes) + '.' + b64urlEncodeBytes(sig);
+}
+
+async function validSession(request, env) {
+  const expectedUser = env.SITE_USER || 'samuele';
+  const key = await authKey(env);
+  if (!key) return false;
+  const token = cookieValue(request, AUTH_COOKIE);
+  if (!token || !token.includes('.')) return false;
   try {
-    const decoded = atob(header.slice(6));
-    const sep = decoded.indexOf(':');
-    if (sep < 0) return false;
-    const user = decoded.slice(0, sep);
-    const pass = decoded.slice(sep + 1);
-    return user === expectedUser && pass === expectedPassword;
+    const [p,s] = token.split('.',2);
+    const payloadBytes = b64urlDecodeBytes(p);
+    const sigBytes = b64urlDecodeBytes(s);
+    const ok = await crypto.subtle.verify('HMAC', key, sigBytes, payloadBytes);
+    if (!ok) return false;
+    const payload = new TextDecoder().decode(payloadBytes);
+    const split = payload.lastIndexOf('|');
+    if (split < 0) return false;
+    const user = payload.slice(0,split);
+    const exp = Number(payload.slice(split+1));
+    return user === expectedUser && Number.isFinite(exp) && exp > Math.floor(Date.now()/1000);
   } catch (_) {
     return false;
   }
 }
 
+function safeNext(value) {
+  const v = String(value || '/');
+  return v.startsWith('/') && !v.startsWith('//') ? v : '/';
+}
+
+function loginPage(next='/', error='') {
+  const esc = s => String(s||'').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+  const errorHtml = error ? '<div class="error">'+esc(error)+'</div>' : '';
+  return new Response(`<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#07111d">
+<title>Accesso · BMW X3 M40d</title>
+<style>
+:root{--bg:#07111d;--card:#102239;--line:#31506d;--text:#f4f7fb;--muted:#9fb2c7;--blue:#4b98ff;--red:#ff7c7c}
+*{box-sizing:border-box}html,body{margin:0;min-height:100%;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:radial-gradient(circle at 20% 0,#173b65 0,transparent 38%),linear-gradient(180deg,#091827,var(--bg));color:var(--text)}
+body{display:grid;place-items:center;padding:24px}.wrap{width:min(420px,100%)}.brand{text-align:center;margin-bottom:22px}.roundel{width:64px;height:64px;margin:0 auto 14px;border:3px solid #fff;border-radius:50%;background:conic-gradient(#fff 0 25%,#2494ff 0 50%,#fff 0 75%,#2494ff 0);box-shadow:0 0 0 3px #17202c inset}.brand h1{font-size:25px;margin:0 0 6px}.brand p{margin:0;color:var(--muted);font-size:14px}.card{background:rgba(16,34,57,.94);border:1px solid var(--line);border-radius:22px;padding:22px;box-shadow:0 24px 70px rgba(0,0,0,.35)}label{display:block;font-size:13px;color:var(--muted);margin:13px 0 6px}input[type=text],input[type=password]{width:100%;border:1px solid var(--line);border-radius:12px;background:#091827;color:var(--text);padding:14px 15px;font-size:16px;outline:none}input:focus{border-color:var(--blue);box-shadow:0 0 0 3px rgba(75,152,255,.14)}.remember{display:flex;align-items:center;gap:10px;margin:16px 0;color:#c8d6e5;font-size:14px}.remember input{width:19px;height:19px}.btn{width:100%;border:0;border-radius:13px;background:var(--blue);color:white;font-weight:750;font-size:16px;padding:14px;cursor:pointer}.error{background:rgba(255,124,124,.12);border:1px solid rgba(255,124,124,.35);color:#ffb1b1;border-radius:10px;padding:10px 12px;font-size:13px;margin-bottom:12px}.note{text-align:center;color:var(--muted);font-size:12px;margin-top:14px;line-height:1.45}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="brand"><div class="roundel"></div><h1>BMW X3 M40d</h1><p>Dashboard personale</p></div>
+  <form class="card" method="post" action="/login">
+    ${errorHtml}
+    <input type="hidden" name="next" value="${esc(safeNext(next))}">
+    <label for="user">Utente</label>
+    <input id="user" name="username" type="text" value="samuele" autocomplete="username" autocapitalize="none" required>
+    <label for="pass">Password</label>
+    <input id="pass" name="password" type="password" autocomplete="current-password" required autofocus>
+    <label class="remember"><input type="checkbox" name="remember" value="1" checked> Ricordami su questo dispositivo per 30 giorni</label>
+    <button class="btn" type="submit">Accedi</button>
+    <div class="note">La sessione è salvata in un cookie sicuro e HttpOnly.</div>
+  </form>
+</div>
+</body>
+</html>`, {status:200,headers:{'Content-Type':'text/html; charset=utf-8','Cache-Control':'no-store'}});
+}
+
+async function handleLogin(request, env) {
+  if (!env.SITE_PASSWORD) return new Response('SITE_PASSWORD non configurata', {status:503});
+  let form;
+  try { form = await request.formData(); } catch (_) { return loginPage('/', 'Richiesta non valida'); }
+  const expectedUser = env.SITE_USER || 'samuele';
+  const user = String(form.get('username') || '');
+  const pass = String(form.get('password') || '');
+  const remember = form.get('remember') === '1';
+  const next = safeNext(form.get('next'));
+  if (user !== expectedUser || pass !== env.SITE_PASSWORD) return loginPage(next, 'Utente o password non corretti');
+  const token = await createSessionToken(env, expectedUser, remember);
+  const attrs = ['Path=/','HttpOnly','Secure','SameSite=Lax'];
+  if (remember) attrs.push('Max-Age=2592000');
+  return new Response(null, {
+    status:303,
+    headers:{'Location':next,'Set-Cookie':AUTH_COOKIE+'='+token+'; '+attrs.join('; '),'Cache-Control':'no-store'}
+  });
+}
+
+function logoutResponse() {
+  return new Response(null, {
+    status:303,
+    headers:{'Location':'/login','Set-Cookie':AUTH_COOKIE+'=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0','Cache-Control':'no-store'}
+  });
+}
+
+function unauthenticatedApi() {
+  return new Response(JSON.stringify({error:'authentication_required'}), {
+    status:401,
+    headers:{'Content-Type':'application/json','Cache-Control':'no-store'}
+  });
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+    const path = url.pathname;
     const cors = {
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
@@ -49,18 +162,26 @@ export default {
     };
     if (request.method === 'OPTIONS') return new Response(null, { headers: cors });
 
-    // Protect all browser/API reads. POST ingestion stays reachable so BMW
-    // telemetry can continue to populate D1 without browser credentials.
-    if (request.method !== 'POST' && !hasValidBasicAuth(request, env)) {
-      return unauthorizedResponse();
-    }
-
     try {
+      if (path === '/login' && request.method === 'POST') return await handleLogin(request, env);
+      if (path === '/login' && request.method === 'GET') {
+        if (await validSession(request, env)) return Response.redirect(url.origin + '/', 303);
+        return loginPage(url.searchParams.get('next') || '/');
+      }
+      if (path === '/logout' && request.method === 'GET') return logoutResponse();
+
+      // Telemetry ingestion remains reachable without a browser session.
+      // Other pages and APIs require the signed session cookie.
+      const isTelemetryPost = request.method === 'POST' && path !== '/update-price';
+      if (!isTelemetryPost && !(await validSession(request, env))) {
+        if (path.startsWith('/api/')) return unauthenticatedApi();
+        return loginPage(path + url.search);
+      }
+
       if (request.method === 'POST') {
-        const path = url.pathname;
+        if (path === '/update-price') return updatePrice(request, env, cors);
         return await handlePost(request, env, cors);
       }
-      const path = url.pathname;
       if (path === '/api/data')      return await handleGetData(env, cors);
       if (path === '/api/analytics') return await handleGetAnalytics(env, parseInt(url.searchParams.get('days') || '30'), cors);
       if (path === '/api/dump')      return await handleDump(env, cors);
@@ -2325,6 +2446,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
              <a href="/fuel" class="pill" style="text-decoration:none;background:rgba(255,181,92,.2);color:#ffb55c">⛽ Carburante</a>
              <a href="/locations" class="pill" style="text-decoration:none;background:rgba(147,112,219,.2);color:#9370db">📍 Posizioni</a>
              <a href="/history" class="pill" style="text-decoration:none;background:rgba(255,152,0,.2);color:#ff9800">📜 Cronologia</a>
+             <a href="/logout" class="pill" style="text-decoration:none;background:rgba(255,255,255,.08);color:var(--muted)">Esci</a>
           </div>
           <div id="heroStats" style="margin-top:12px;font-size:13px;color:var(--muted);display:flex;flex-wrap:wrap;gap:8px 16px">
             <span id="heroLock" style="padding:2px 10px;border-radius:12px;font-weight:700">🔒 —</span>
