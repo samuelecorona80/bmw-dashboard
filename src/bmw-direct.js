@@ -477,6 +477,7 @@ export async function runBmwDirectFetch(env, {force=false} = {}) {
       kinds.push('telematicData');
       kinds.push('current:' + ingestion.descriptorCount);
       if (dayDistance.updated) kinds.push('todayKm:' + dayDistance.distanceKm);
+      else kinds.push('todayKm:n/a');
     }
     await saveState(env, {last_fetch_at:now,last_fetch_status:kinds.join('+'),last_error:null,updated_at:now});
     return {
@@ -485,7 +486,8 @@ export async function runBmwDirectFetch(env, {force=false} = {}) {
       kinds,
       telematicConfigured:Boolean(container.id),
       containerSource:container.source,
-      containerCount:container.count ?? null
+      containerCount:container.count ?? null,
+      dayDistance: typeof dayDistance !== 'undefined' ? dayDistance : null
     };
   } catch (err) {
     const message = err?.message || String(err);
