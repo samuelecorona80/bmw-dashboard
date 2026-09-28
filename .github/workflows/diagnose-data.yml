@@ -23,5 +23,7 @@ jobs:
           npx wrangler@latest d1 execute bmw-vehicle-data --remote --command "SELECT c_timestamp,travelled_distance FROM bmw_cardata_raw ORDER BY c_timestamp DESC LIMIT 12;" --json
           echo "=== key mileage entities recent values ==="
           npx wrangler@latest d1 execute bmw-vehicle-data --remote --command "SELECT snapshot_timestamp,entity_id,state,bmw_timestamp,last_updated,trigger_reason FROM bmw_raw_daily WHERE entity_id IN ('sensor.x3_m40d_vehicle_mileage','sensor.x3_m40d_driving_distance_this_month') ORDER BY snapshot_timestamp DESC LIMIT 50;" --json
+          echo "=== monthly distance sensor history ==="
+          npx wrangler@latest d1 execute bmw-vehicle-data --remote --command "SELECT snapshot_timestamp,state,bmw_timestamp,last_updated,trigger_reason FROM bmw_raw_daily WHERE entity_id='sensor.x3_m40d_driving_distance_this_month' ORDER BY snapshot_timestamp DESC LIMIT 20;" --json
           echo "=== entity ingestion latest seen ==="
           npx wrangler@latest d1 execute bmw-vehicle-data --remote --command "SELECT MAX(last_seen) AS latest_seen, COUNT(*) AS entities FROM bmw_entities;" --json
