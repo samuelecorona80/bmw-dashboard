@@ -251,8 +251,10 @@ async function apiGet(env, path, accessToken) {
 async function discoverContainerId(env, accessToken, {refresh=false} = {}) {
   if (env.BMW_CONTAINER_ID) return {id:env.BMW_CONTAINER_ID, source:'env'};
   const cached = await getMeta(env,'container_id');
-  const cachedAge = cached?.updated_at ? Date.now()-Date.parse(cached.updated_at) : Infinity;
-  if (!refresh && cached?.value && Number.isFinite(cachedAge) && cachedAge < 7*24*60*60*1000) {
+  // Container IDs are stable. Reuse the discovered BavarianData/existing container
+  // indefinitely to avoid spending one shared BMW REST request on /customers/containers.
+  // Use refresh=true only if telematicData later proves that the cached ID is invalid.
+  if (!refresh && cached?.value) {
     return {id:cached.value, source:'cached', count:null};
   }
   const payload = await apiGet(env, '/customers/containers', accessToken);
@@ -593,9 +595,11 @@ export async function runBmwDirectFetch(env, {force=false} = {}) {
     const kinds = [];
     let container = null;
 
-    // Expensive/static metadata: at most once per 24 h.
+    // Static metadata: refresh weekly, not daily. BMW's REST quota is shared
+    // across this Worker and BavarianData, so normal runs should spend only
+    // the single telematicData request.
     const mappingsAge = await latestRawAgeMs(env,'mappings');
-    if (mappingsAge >= 24*60*60*1000) {
+    if (mappingsAge >= 7*24*60*60*1000) {
       const mappingResult = await getMappingsWithAuthRecovery(env, token);
       if (mappingResult.recovered) token = await validAccessToken(env);
       await saveRaw(env,'mappings',vin,mappingResult.data);
@@ -603,13 +607,14 @@ export async function runBmwDirectFetch(env, {force=false} = {}) {
     } else kinds.push('mappings:cached');
 
     const basicAge = await latestRawAgeMs(env,'basicData');
-    if (basicAge >= 24*60*60*1000) {
+    if (basicAge >= 7*24*60*60*1000) {
       const basic = await apiGet(env,'/customers/vehicles/' + encodeURIComponent(vin) + '/basicData',token);
       await saveRaw(env,'basicData',vin,basic);
       kinds.push('basicData');
     } else kinds.push('basicData:cached');
 
-    // Container list: cached for 7 days. This removes one REST call from normal refreshes.
+    // Container list: reuse the cached/env ID indefinitely. /customers/containers
+    // is only called when no ID has ever been discovered.
     container = await discoverContainerId(env, token, {refresh:false});
 
     let dayDistance = {updated:false, reason:'telematic_not_fetched'};
