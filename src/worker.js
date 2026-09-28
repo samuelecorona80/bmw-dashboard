@@ -2924,7 +2924,7 @@ function renderDataHealth(d,direct){
     return '<div class="health-item"><small>'+a[0]+'</small><strong style="color:'+col+'">'+label+'</strong><div class="mini-note">'+(x.timestamp?escapeHtml(ageLabel(x.timestamp)):'Timestamp non disponibile')+'</div></div>';
   }).join('');
   if(direct){
-    var q=direct.apiQuota||{}, limited=Boolean(q.remoteRateLimitedAt);
+    var q=direct.apiQuota||{}, limited=Boolean(q.remoteRateLimitedAt && q.remoteEstimatedReset && Date.parse(q.remoteEstimatedReset)>Date.now());
     var directState=limited?'Quota BMW esaurita':(direct.lastError?'Errore ultimo fetch':(direct.hasToken?'Connesso':'Non autorizzato'));
     var col=limited||direct.lastError?'var(--red)':(direct.hasToken?'var(--green)':'var(--amber)');
     html+='<div class="health-item"><small>BMW Direct</small><strong style="color:'+col+'">'+escapeHtml(directState)+'</strong><div class="mini-note">'+(direct.lastFetchAt?'Ultimo fetch '+escapeHtml(formatTimestamp(direct.lastFetchAt)):'Nessun fetch')+'</div></div>';
@@ -2937,7 +2937,7 @@ function renderDataHealth(d,direct){
 }
 function renderAttention(d,direct){
   var items=[],q=direct&&direct.apiQuota;
-  if(q&&q.remoteRateLimitedAt) items.push({level:'alert',text:'BMW API: quota esaurita'});
+  if(q&&q.remoteRateLimitedAt&&q.remoteEstimatedReset&&Date.parse(q.remoteEstimatedReset)>Date.now()) items.push({level:'alert',text:'BMW API: quota esaurita'});
   if(d.tyres&&d.tyres.alerts&&d.tyres.alerts.any) items.push({level:'warn',text:'Pressione pneumatici fuori target'});
   if(d.tyres&&d.tyres.trendAlerts&&d.tyres.trendAlerts.any) items.push({level:'warn',text:'Variazione pressione pneumatici'});
   if(d.security){
