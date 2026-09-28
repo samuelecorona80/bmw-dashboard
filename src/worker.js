@@ -2598,8 +2598,8 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       <article class="card hero-card">
         <div class="hero-copy">
           <div class="eyebrow">BMW X3 M40d · G01</div>
-          <h1>Più lontano,<br><span>insieme.</span></h1>
-          <p>Stato, percorrenza, consumi e manutenzione in un’unica vista.</p>
+          <h1>Stato vettura<br><span>e utilizzo</span></h1>
+          <p>Chilometri, carburante, posizione, pneumatici e manutenzione.</p>
           <div class="hero-pills">
             <span class="pill" id="homePill">● Stato vettura</span>
             <button type="button" class="pill pill-button" id="dataHealth" onclick="toggleDataHealth()" style="font-size:11px;padding:7px 10px">◌ Stato dati</button>
