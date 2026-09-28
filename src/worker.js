@@ -267,13 +267,35 @@ async function getLocationLabel(db, location){
     const r=await fetch(u,{headers:{'Accept':'application/json','Accept-Language':'it','User-Agent':'samuele-bmw-dashboard/1.0'}});
     if(!r.ok) return cached?{label:cached.label||cached.display_name,displayName:cached.display_name||cached.label,source:'cache'}:null;
     const x=await r.json(), a=x.address||{};
-    const poi=a.amenity||a.shop||a.tourism||a.leisure||a.office||a.building||null;
     const road=a.road||a.pedestrian||a.residential||a.path||a.cycleway||null;
     const house=a.house_number||null;
     const locality=a.city||a.town||a.village||a.municipality||a.suburb||null;
-    let label=poi || [road,house].filter(Boolean).join(' ');
+    const genericName = x.name && x.name !== road && x.name !== house ? x.name : null;
+    const poi=a.amenity||a.shop||a.tourism||a.leisure||a.office||null;
+    let label=genericName || poi || [road,house].filter(Boolean).join(' ');
+
+    // Reverse geocoding often returns the street even when the car is inside a named
+    // campus/building. Ask OSM for the nearest named non-road feature before falling
+    // back to the street address.
+    if(!genericName && !poi){
+      try{
+        const q='[out:json][timeout:5];(nwr(around:120,'+lat+','+lng+')[name][highway!~"."];);out center tags 20;';
+        const ov=await fetch('https://overpass-api.de/api/interpreter',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded','User-Agent':'samuele-bmw-dashboard/1.0'},body:'data='+encodeURIComponent(q)});
+        if(ov.ok){
+          const oj=await ov.json(), candidates=(oj.elements||[]).map(e=>{
+            const clat=e.lat??e.center?.lat, clon=e.lon??e.center?.lon;
+            if(!Number.isFinite(Number(clat))||!Number.isFinite(Number(clon))||!e.tags?.name) return null;
+            const dlat=(Number(clat)-lat)*111.32, dlng=(Number(clon)-lng)*111.32*Math.cos(lat*Math.PI/180);
+            return {name:e.tags.name, dist:Math.sqrt(dlat*dlat+dlng*dlng), tags:e.tags};
+          }).filter(Boolean).filter(e=>e.dist<=0.12)
+            .filter(e=>!['street','road'].includes(String(e.tags.place||'').toLowerCase()))
+            .sort((a,b)=>a.dist-b.dist);
+          if(candidates.length) label=candidates[0].name;
+        }
+      }catch(_){}
+    }
     if(label && locality && !String(label).includes(locality)) label += ' · '+locality;
-    if(!label) label=x.name||x.display_name||null;
+    if(!label) label=x.display_name||null;
     const fetchedAt=new Date().toISOString();
     await db.prepare('INSERT INTO bmw_geocode_cache(cache_key,lat,lng,label,display_name,fetched_at) VALUES(?,?,?,?,?,?) ON CONFLICT(cache_key) DO UPDATE SET lat=excluded.lat,lng=excluded.lng,label=excluded.label,display_name=excluded.display_name,fetched_at=excluded.fetched_at')
       .bind(key,lat,lng,label,x.display_name||label,fetchedAt).run();
@@ -612,17 +634,17 @@ async function handleGetData(env, cors) {
     }
   }
   let lastMovement = null;
-  if (progress.length >= 2) {
-    const last = progress[progress.length - 1];
-    const prev = progress[progress.length - 2];
+  const directProgress = progress.filter(e => e.source === 'BMW CarData · Cloudflare');
+  if (directProgress.length >= 2) {
+    const last = directProgress[directProgress.length - 1];
+    const prev = directProgress[directProgress.length - 2];
     const moved = last.km - prev.km;
-    if (moved > 0 && moved < 1000) lastMovement = { distanceKm: Math.round(moved * 10) / 10, timestamp: last.timestamp, source: last.source, odometerKm: last.km };
+    if (moved > 0 && moved < 1000) lastMovement = { distanceKm: Math.round(moved * 10) / 10, timestamp: last.timestamp, source: 'BMW CarData · Cloudflare', odometerKm: last.km };
   }
 
-  // "Km oggi" = increments actually observed during today's Rome calendar day.
-  // Never bridge yesterday -> today: that can assign a late/unobserved previous-day
-  // drive to today (the previous implementation was doing exactly that).
-  const todayProgress = progress.filter(e => e.date === todayRome);
+  // "Km oggi" must only use samples collected by the new direct Cloudflare path.
+  // Legacy HA/history can remain in D1 for history, but it must not contaminate today's live tile.
+  const todayProgress = progress.filter(e => e.date === todayRome && e.source === 'BMW CarData · Cloudflare');
   if (todayProgress.length >= 2) {
     let total = 0;
     for (let i = 1; i < todayProgress.length; i++) {
@@ -631,13 +653,11 @@ async function handleGetData(env, cors) {
     }
     resolvedDailyKm = Math.round(total * 10) / 10;
     const latestToday = todayProgress[todayProgress.length - 1];
-    resolvedDailyKmSource = latestToday.source || 'BMW CarData';
+    resolvedDailyKmSource = 'BMW CarData · Cloudflare';
     resolvedDailyKmTimestamp = latestToday.timestamp;
   } else if (todayProgress.length === 1) {
-    // We have today's current odometer but no same-day baseline yet.
-    // Showing 0 or bridging from yesterday would both be misleading.
     resolvedDailyKm = null;
-    resolvedDailyKmSource = todayProgress[0].source || 'BMW CarData';
+    resolvedDailyKmSource = 'BMW CarData · Cloudflare';
     resolvedDailyKmTimestamp = todayProgress[0].timestamp;
   }
 
@@ -757,6 +777,17 @@ async function handleGetData(env, cors) {
   const consumptionPoints=(analytics.consumption&&analytics.consumption.points)||[];
   const consumptionCoveredKm=consumptionPoints.reduce((s,p)=>s+(Number(p.deltaKm)||0),0);
   const consumptionConfidence=consumptionPoints.length>=8&&consumptionCoveredKm>=500?'alta':(consumptionPoints.length>=4&&consumptionCoveredKm>=200?'media':'bassa');
+  const obfcmFuelL=toNum(state('vehicle.drivetrain.fuelSystem.consumptionOverLifeTime.overall.fuel'));
+  const obfcmDistanceKm=toNum(state('vehicle.drivetrain.fuelSystem.consumptionOverLifeTime.overall.referenceDistance'));
+  let consumptionKmL=null, consumptionSource=null;
+  if(obfcmFuelL>0 && obfcmDistanceKm>0){
+    const v=obfcmDistanceKm/obfcmFuelL;
+    if(v>=3 && v<=35){consumptionKmL=Math.round(v*10)/10;consumptionSource='BMW OBFCM';}
+  }
+  if(consumptionKmL===null && consumptionConfidence!=='bassa' && analytics.consumption.latest>0){
+    const v=100/analytics.consumption.latest;
+    if(v>=3 && v<=35){consumptionKmL=Math.round(v*10)/10;consumptionSource='stima storica';}
+  }
   const locationState = state('device_tracker.x3_m40d');
   const normalizeLocation = v => { if(!v) return 'Stato sconosciuto'; return String(v).toLowerCase()==='home'?'Home':String(v); };
 
@@ -922,6 +953,8 @@ async function handleGetData(env, cors) {
       dailyKmStale: mileageAgeHours !== null ? mileageAgeHours > 6 : true,
       dailyKmBaseline: beforeTodayEvent ? beforeTodayEvent.km : null,
       consumptionL100: analytics.consumption.latest,
+      consumptionKmL,
+      consumptionSource,
       ecoProPercent: ecoPro,
       vehicleState: tripInProgress===true ? 'In viaggio' : ((locationLabel && locationLabel.label) || normalizeLocation(locationState))
     },
@@ -3050,7 +3083,7 @@ function renderDashboard(d){
 function renderQuickStats(d){
   $('quickKm').textContent=d.quick.dailyKm===null?'—':\`\${fmt1(d.quick.dailyKm)} km\`;
   if(d.quick.dailyKm===null){
-    $('quickKmNote').textContent=d.core.mileageUpdatedAt?'odometro invariato da '+formatTimestamp(d.core.mileageUpdatedAt):'dato odometro non disponibile';
+    $('quickKmNote').textContent=d.quick.dailyKmUpdatedAt?'baseline diretta iniziata '+formatTimestamp(d.quick.dailyKmUpdatedAt)+' · dato odierno parziale':'dato odometro diretto non disponibile';
   }else if(d.quick.dailyKmStale){
     $('quickKmNote').textContent=(d.quick.dailyKm>0?'almeno ':'')+fmt1(d.quick.dailyKm)+' km · odometro da aggiornare';
   }else if(d.quick.dailyKm===0){
@@ -3059,10 +3092,11 @@ function renderQuickStats(d){
     var src=d.quick.dailyKmSource?(' · '+d.quick.dailyKmSource):'';
     $('quickKmNote').textContent='distanza odierna'+src;
   }
-  $('quickConsumption').textContent=(d.quick.consumptionL100===null||!(d.quick.consumptionL100>0))?'—':fmt1(100/d.quick.consumptionL100)+' km/L';
-  if (d.analytics && d.analytics.consumption && d.analytics.consumption.points && d.analytics.consumption.points.length > 0) {
-    const avgC = d.analytics.consumption.average, q=d.consumptionQuality||{};
-    $('quickConsumptionNote').textContent = avgC ? 'stima · affidabilità '+(q.confidence||'bassa')+' · '+(q.coveredKm||0)+' km coperti' : 'stima ultimo intervallo';
+  $('quickConsumption').textContent=(d.quick.consumptionKmL===null||!(d.quick.consumptionKmL>0))?'—':fmt1(d.quick.consumptionKmL)+' km/L';
+  if(d.quick.consumptionKmL!==null){
+    $('quickConsumptionNote').textContent=(d.quick.consumptionSource||'BMW')+(d.quick.consumptionSource==='stima storica'?' · affidabilità '+((d.consumptionQuality||{}).confidence||'n.d.'):'');
+  }else{
+    $('quickConsumptionNote').textContent='dato non abbastanza affidabile';
   }
   $('quickEco').textContent=\`\${fmtInt(d.quick.ecoProPercent)}%\`;
   $('quickStatus').textContent=d.quick.vehicleState||'—';
