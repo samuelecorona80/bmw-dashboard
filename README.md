@@ -58,3 +58,18 @@ Authenticated admin endpoints:
 - `POST /api/bmw-direct/fetch`
 
 A cron trigger runs every four hours. Until runtime settings and OAuth authorization are present, it exits without changing existing dashboard data.
+
+## Home Assistant primary ingestion
+
+Production architecture:
+
+`BMW CarData → BavarianData → Home Assistant → POST /api/ingest → D1 → dashboard`
+
+The direct BMW REST integration is retained only for manual diagnostics/fallback.
+There is no automatic BMW REST cron, so the dashboard does not consume the shared
+BMW REST quota during normal operation.
+
+Home Assistant should POST snapshots to `/api/ingest` with
+`Authorization: Bearer <BMW_WRITE_TOKEN>`. The endpoint performs timestamp-aware
+deduplication and rejects stale state from overwriting newer BMW/MQTT data.
+
