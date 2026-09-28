@@ -61,10 +61,9 @@ jobs:
 
       - name: Verify production endpoint
         run: |
-          curl --fail --silent --show-error --retry 5 --retry-delay 5 https://bmw.samuelecorona.it/api/data > /tmp/bmw.json
-          python - <<'PY'
-          import json
-          d=json.load(open("/tmp/bmw.json"))
-          assert "core" in d, "Production API did not return dashboard payload"
-          print("Production API OK")
-          PY
+          # The dashboard is password-protected in production. A healthy
+          # unauthenticated request must return 401 with a Basic auth challenge.
+          code=$(curl --silent --show-error --retry 5 --retry-delay 5 -D /tmp/headers.txt -o /tmp/body.txt -w "%{http_code}" https://bmw.samuelecorona.it/api/data)
+          test "$code" = "401" || (echo "Expected HTTP 401 from protected production API, got $code" && cat /tmp/body.txt && exit 1)
+          grep -qi '^www-authenticate: Basic ' /tmp/headers.txt || (echo "Missing Basic auth challenge" && cat /tmp/headers.txt && exit 1)
+          echo "Production API protected and reachable"
