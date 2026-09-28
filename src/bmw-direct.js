@@ -425,7 +425,9 @@ export async function runBmwDirectFetch(env, {force=false} = {}) {
         token
       );
       await saveRaw(env, 'telematicData', vin, telematic);
+      const ingestion = await ingestDirectTelematic(env, vin, telematic, now);
       kinds.push('telematicData');
+      kinds.push('current:' + ingestion.descriptorCount);
     }
     await saveState(env, {last_fetch_at:now,last_fetch_status:kinds.join('+'),last_error:null,updated_at:now});
     return {
