@@ -9,4 +9,4 @@ database_name = "bmw-vehicle-data"
 database_id = ""
 
 [triggers]
-crons = ["17 */4 * * *"]
+crons = ["17 * * * *"]
