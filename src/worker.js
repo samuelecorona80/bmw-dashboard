@@ -267,10 +267,17 @@ async function handlePost(request, env, cors) {
   const db = env.DB;
 
   // 1. Read current state for dedup
-  const currentRows = await db.prepare('SELECT entity_id, value, bmw_timestamp, attributes_json FROM bmw_current').all();
+  const currentRows = await db.prepare('SELECT entity_id, value, bmw_timestamp, last_updated, last_changed, attributes_json FROM bmw_current').all();
   const prevMap = {};
+  const eventTs = (obj, fallback='') => obj?.bmw_timestamp || obj?.bmwTimestamp || obj?.last_updated || obj?.lastUpdated || obj?.last_changed || obj?.lastChanged || fallback || '';
+  const tsMs = v => { const n=Date.parse(v||''); return Number.isFinite(n)?n:null; };
   for (const r of currentRows.results) {
-    prevMap[r.entity_id] = { state: r.value, bmwTimestamp: r.bmw_timestamp || '' };
+    prevMap[r.entity_id] = {
+      state: r.value,
+      bmwTimestamp: r.bmw_timestamp || '',
+      lastUpdated: r.last_updated || '',
+      lastChanged: r.last_changed || ''
+    };
   }
 
   // 2. Write raw (deduplicated)
@@ -294,19 +301,50 @@ async function handlePost(request, env, cors) {
   }
   if (rawBatch.length > 0) await db.batch(rawBatch);
 
-  // 3. Upsert bmw_current (replace all)
-  const currentBatch = [db.prepare('DELETE FROM bmw_current')];
+  // 3. Merge bmw_current without allowing an older scheduled snapshot
+  // to overwrite a newer BMW/MQTT event.
+  const acceptedEntities = [];
+  let rejectedStale = 0;
+  const currentBatch = [];
   for (const ent of entities) {
+    const prev = prevMap[ent.entity_id];
+    const incomingStamp = eventTs(ent, snapshotTs);
+    const prevStamp = eventTs(prev);
+    const incomingMs = tsMs(incomingStamp);
+    const prevMs = tsMs(prevStamp);
+
+    // If both timestamps are known, never move an entity backwards in time.
+    // If timestamps are equal, keep the existing value unless the entity is new.
+    const isOlder = prev && incomingMs !== null && prevMs !== null && incomingMs < prevMs;
+    const sameStampDifferentValue = prev && incomingMs !== null && prevMs !== null &&
+      incomingMs === prevMs && String(ent.state) !== String(prev.state);
+
+    if (isOlder || sameStampDifferentValue) {
+      rejectedStale++;
+      continue;
+    }
+
+    acceptedEntities.push(ent);
     currentBatch.push(db.prepare(
-      `INSERT INTO bmw_current (entity_id, category, friendly_name, value, unit, last_changed, last_updated, bmw_timestamp, attributes_json)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO bmw_current
+       (entity_id, category, friendly_name, value, unit, last_changed, last_updated, bmw_timestamp, attributes_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(entity_id) DO UPDATE SET
+         category=excluded.category,
+         friendly_name=excluded.friendly_name,
+         value=excluded.value,
+         unit=excluded.unit,
+         last_changed=excluded.last_changed,
+         last_updated=excluded.last_updated,
+         bmw_timestamp=excluded.bmw_timestamp,
+         attributes_json=excluded.attributes_json`
     ).bind(
       ent.entity_id, ent.category || '', ent.friendly_name || '', String(ent.state),
       ent.unit || '', ent.last_changed || '', ent.last_updated || '',
       ent.bmw_timestamp || '', JSON.stringify(ent.attributes || {})
     ));
   }
-  await db.batch(currentBatch);
+  if (currentBatch.length) await db.batch(currentBatch);
 
   // 4. Update entities map
   const entBatch = [];
@@ -322,12 +360,13 @@ async function handlePost(request, env, cors) {
   }
   await db.batch(entBatch);
 
-  // 5. Upsert daily
-  await upsertDaily(db, snapshotTs, snapshotDate, entities);
+  // 5. Upsert daily using only values that passed freshness checks.
+  await upsertDaily(db, snapshotTs, snapshotDate, acceptedEntities);
 
   return jsonResponse({
     status: 'OK', snapshot: snapshotTs, date: snapshotDate,
-    trigger: triggerReason, rawNew: newRows, rawSkipped: skipped, entities: entities.length
+    trigger: triggerReason, rawNew: newRows, rawSkipped: skipped,
+    entities: entities.length, accepted: acceptedEntities.length, rejectedStale
   }, 200, cors);
 }
 
@@ -349,24 +388,29 @@ async function upsertDaily(db, snapshotTs, snapshotDate, entities) {
 
   // Check existing row for this date
   const existing = await db.prepare(
-    'SELECT id, data_json, mileage_start_km FROM bmw_daily WHERE snapshot_date = ?'
+    'SELECT id, data_json, mileage_start_km, mileage_km, daily_distance_km, fuel_percent, fuel_litres, range_km, lock_state FROM bmw_daily WHERE snapshot_date = ?'
   ).bind(snapshotDate).first();
 
   let mileageStart = existing ? existing.mileage_start_km : null;
-  if (mileageStart === null && currentMileage !== null) mileageStart = currentMileage;
-  if (currentMileage !== null && mileageStart !== null && currentMileage < mileageStart) {
-    mileageStart = currentMileage;
+  let mileageEnd = existing ? existing.mileage_km : null;
+  if (currentMileage !== null) {
+    // Odometer is monotonic. Never let a stale lower value corrupt a day.
+    if (mileageStart === null) mileageStart = currentMileage;
+    if (mileageEnd === null || currentMileage > mileageEnd) mileageEnd = currentMileage;
   }
-
-  const dailyDistance = (mileageStart !== null && currentMileage !== null)
-    ? currentMileage - mileageStart : null;
+  const dailyDistance = (mileageStart !== null && mileageEnd !== null && mileageEnd >= mileageStart)
+    ? mileageEnd - mileageStart
+    : (existing ? existing.daily_distance_km : null);
 
   // Extract key metrics
-  const mileageKm = currentMileage;
-  const fuelPercent = parseFloat(vals['X3 M40d Range Tank level (%)'] || vals['Fuel %'] || '') || null;
-  const fuelLitres = parseFloat(vals['X3 M40d Range Tank level'] || vals['Fuel L'] || '') || null;
-  const rangeKm = parseFloat(vals['X3 M40d Range Total range (last sent)'] || vals['Range km'] || '') || null;
-  const lockState = vals['X3 M40d Doors lock'] || vals['Lock State'] || null;
+  const mileageKm = mileageEnd;
+  const parsedFuelPercent = parseFloat(vals['X3 M40d Range Tank level (%)'] || vals['Fuel %'] || '');
+  const parsedFuelLitres = parseFloat(vals['X3 M40d Range Tank level'] || vals['Fuel L'] || '');
+  const parsedRangeKm = parseFloat(vals['X3 M40d Range Total range (last sent)'] || vals['Range km'] || '');
+  const fuelPercent = Number.isFinite(parsedFuelPercent) ? parsedFuelPercent : (existing ? existing.fuel_percent : null);
+  const fuelLitres = Number.isFinite(parsedFuelLitres) ? parsedFuelLitres : (existing ? existing.fuel_litres : null);
+  const rangeKm = Number.isFinite(parsedRangeKm) ? parsedRangeKm : (existing ? existing.range_km : null);
+  const lockState = vals['X3 M40d Doors lock'] || vals['Lock State'] || (existing ? existing.lock_state : null);
 
   // Merge with existing data_json
   let dataJson = {};
