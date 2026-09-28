@@ -975,8 +975,12 @@ async function handleGetData(env, cors) {
       dieselPriceDate: dieselPriceDate,
       dieselPriceSource,
       dieselPriceMeta,
-      costPerKm: analytics.consumption.average ? (analytics.consumption.average / 100 * dieselPriceEur) : null,
-      costThisMonth: distanceThisMonth && analytics.consumption.average ? Math.round(distanceThisMonth * analytics.consumption.average / 100 * dieselPriceEur) : null
+      consumptionKmL: consumptionKmL,
+      consumptionSource: consumptionSource,
+      costPerKm: consumptionKmL && consumptionKmL > 0 ? (dieselPriceEur / consumptionKmL) : null,
+      costThisMonth: distanceThisMonth && consumptionKmL && consumptionKmL > 0
+        ? Math.round((distanceThisMonth / consumptionKmL) * dieselPriceEur)
+        : null
     },
     meta: {
       monitoredEntities: Object.keys(current).length,
@@ -1028,7 +1032,9 @@ function computeDailyAnalytics(history) {
     const fuelUsedL = prevFuelL - currFuelL;
     if (!(fuelUsedL > 0)) continue;
     const l100 = (fuelUsedL / deltaKm) * 100;
-    if (!isFinite(l100) || l100 <= 0) continue;
+    // Snapshot timing can create unrealistic short-interval fuel deltas.
+    // Keep only plausible diesel consumption samples for fallback estimates.
+    if (!isFinite(l100) || l100 < 3 || l100 > 25 || deltaKm < 5) continue;
     consumptionPoints.push({ timestamp: curr.timestamp, value: round_(l100, 1), deltaKm: round_(deltaKm, 1), fuelUsedLitres: round_(fuelUsedL, 2) });
   }
 
@@ -1042,7 +1048,10 @@ function computeDailyAnalytics(history) {
     },
     consumption: {
       latest: consumptionPoints.length ? consumptionPoints[consumptionPoints.length-1].value : null,
-      average: consumptionPoints.length ? round_(avg(consumptionPoints.map(p=>p.value)), 1) : null,
+      average: consumptionPoints.length ? round_(
+        (consumptionPoints.reduce((s,p)=>s+(Number(p.fuelUsedLitres)||0),0) /
+         consumptionPoints.reduce((s,p)=>s+(Number(p.deltaKm)||0),0)) * 100, 1
+      ) : null,
       points: consumptionPoints,
       unit: 'L/100km'
     }
