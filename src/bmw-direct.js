@@ -174,6 +174,133 @@ async function discoverContainerId(env, accessToken) {
   const chosen = preferred || candidates[candidates.length - 1];
   return {id:chosen.containerId, source:preferred ? 'bavariandata_named' : 'existing_latest', count:candidates.length};
 }
+const DIRECT_ALIAS_MAP = {
+  'vehicle.vehicle.travelledDistance': {id:'sensor.x3_m40d_vehicle_mileage', name:'X3 M40d Vehicle mileage'},
+  'vehicle.drivetrain.fuelSystem.level': {id:'sensor.x3_m40d_range_tank_level', name:'X3 M40d Range Tank level (%)'},
+  'vehicle.drivetrain.fuelSystem.remainingFuel': {id:'sensor.x3_m40d_range_tank_level_2', name:'X3 M40d Range Tank level'},
+  'vehicle.drivetrain.lastRemainingRange': {id:'sensor.x3_m40d_range_total_range_last_sent', name:'X3 M40d Range Total range (last sent)'},
+  'vehicle.chassis.axle.row1.wheel.left.tire.pressure': {id:'sensor.x3_m40d_tire_pressure_front_left', name:'X3 M40d Tire pressure (front left)'},
+  'vehicle.chassis.axle.row1.wheel.right.tire.pressure': {id:'sensor.x3_m40d_tire_pressure_front_right', name:'X3 M40d Tire pressure (front right)'},
+  'vehicle.chassis.axle.row2.wheel.left.tire.pressure': {id:'sensor.x3_m40d_tire_pressure_rear_left', name:'X3 M40d Tire pressure (rear left)'},
+  'vehicle.chassis.axle.row2.wheel.right.tire.pressure': {id:'sensor.x3_m40d_tire_pressure_rear_right', name:'X3 M40d Tire pressure (rear right)'},
+  'vehicle.chassis.axle.row1.wheel.left.tire.pressureTarget': {id:'sensor.x3_m40d_tire_pressure_target_front_left', name:'X3 M40d Tire pressure target (front left)'},
+  'vehicle.chassis.axle.row1.wheel.right.tire.pressureTarget': {id:'sensor.x3_m40d_tire_pressure_target_front_right', name:'X3 M40d Tire pressure target (front right)'},
+  'vehicle.chassis.axle.row2.wheel.left.tire.pressureTarget': {id:'sensor.x3_m40d_tire_pressure_target_rear_left', name:'X3 M40d Tire pressure target (rear left)'},
+  'vehicle.chassis.axle.row2.wheel.right.tire.pressureTarget': {id:'sensor.x3_m40d_tire_pressure_target_rear_right', name:'X3 M40d Tire pressure target (rear right)'}
+};
+
+function romeDateKey(value = new Date()) {
+  const d = value instanceof Date ? value : new Date(value);
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone:'Europe/Rome', year:'numeric', month:'2-digit', day:'2-digit'
+  }).formatToParts(d);
+  const g = t => (parts.find(p => p.type === t) || {}).value || '';
+  return g('year') + '-' + g('month') + '-' + g('day');
+}
+
+function telematicMap(payload) {
+  if (!payload || typeof payload !== 'object') return {};
+  const x = payload.telematicData || payload.data || {};
+  return x && typeof x === 'object' && !Array.isArray(x) ? x : {};
+}
+
+async function ingestDirectTelematic(env, vin, payload, fetchedAt) {
+  const data = telematicMap(payload);
+  const batch = [];
+  const rawBatch = [];
+  const entityBatch = [];
+  const daily = {};
+  let newestTs = fetchedAt;
+
+  const pushEntity = (entityId, friendlyName, descriptor, p) => {
+    const ts = p?.timestamp || fetchedAt;
+    if (Date.parse(ts) > Date.parse(newestTs)) newestTs = ts;
+    const value = p?.value;
+    const unit = p?.unit || '';
+    if (value === undefined || value === null) return;
+    const strValue = typeof value === 'object' ? JSON.stringify(value) : String(value);
+
+    batch.push(env.DB.prepare(
+      'INSERT INTO bmw_current (entity_id, category, friendly_name, value, unit, last_changed, last_updated, bmw_timestamp, attributes_json) ' +
+      'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ' +
+      'ON CONFLICT(entity_id) DO UPDATE SET category=excluded.category, friendly_name=excluded.friendly_name, ' +
+      'value=excluded.value, unit=excluded.unit, last_changed=excluded.last_changed, last_updated=excluded.last_updated, ' +
+      'bmw_timestamp=excluded.bmw_timestamp, attributes_json=excluded.attributes_json'
+    ).bind(entityId, 'direct_cardata', friendlyName, strValue, unit, ts, fetchedAt, ts, JSON.stringify({descriptor,source:'cloudflare_direct'})));
+
+    rawBatch.push(env.DB.prepare(
+      'INSERT INTO bmw_raw_daily (snapshot_timestamp, entity_id, friendly_name, state, unit, device_class, last_changed, last_updated, attributes_json, bmw_timestamp, trigger_reason) ' +
+      'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+    ).bind(fetchedAt, entityId, friendlyName, strValue, unit, '', ts, fetchedAt, JSON.stringify({descriptor,source:'cloudflare_direct'}), ts, 'cloudflare_direct'));
+
+    entityBatch.push(env.DB.prepare(
+      "INSERT INTO bmw_entities (entity_id, friendly_name, device, integration, category, unit, first_seen, last_seen, included_in_daily) " +
+      "VALUES (?, ?, ?, 'cloudflare_direct', 'direct_cardata', ?, ?, ?, 'Yes') " +
+      'ON CONFLICT(entity_id) DO UPDATE SET friendly_name=excluded.friendly_name, integration=excluded.integration, category=excluded.category, unit=excluded.unit, last_seen=excluded.last_seen'
+    ).bind(entityId, friendlyName, vin, unit, fetchedAt, fetchedAt));
+  };
+
+  for (const [descriptor, p] of Object.entries(data)) {
+    if (!p || typeof p !== 'object') continue;
+    pushEntity(descriptor, descriptor, descriptor, p);
+    const alias = DIRECT_ALIAS_MAP[descriptor];
+    if (alias) {
+      pushEntity(alias.id, alias.name, descriptor, p);
+      daily[alias.name] = p.value;
+    }
+  }
+
+  if (batch.length) await env.DB.batch(batch);
+  if (rawBatch.length) await env.DB.batch(rawBatch);
+  if (entityBatch.length) await env.DB.batch(entityBatch);
+
+  const date = romeDateKey(fetchedAt);
+  const mileage = Number(daily['X3 M40d Vehicle mileage']);
+  const fuelPct = Number(daily['X3 M40d Range Tank level (%)']);
+  const fuelL = Number(daily['X3 M40d Range Tank level']);
+  const rangeKm = Number(daily['X3 M40d Range Total range (last sent)']);
+  let existing = null;
+  try {
+    existing = await env.DB.prepare('SELECT * FROM bmw_daily WHERE snapshot_date=?').bind(date).first();
+  } catch (_) {}
+
+  if (existing) {
+    let dataJson = {};
+    try { dataJson = existing.data_json ? JSON.parse(existing.data_json) : {}; } catch (_) {}
+    Object.assign(dataJson, daily);
+    const startKm = existing.mileage_start_km ?? (Number.isFinite(mileage) ? mileage : null);
+    const endKm = Number.isFinite(mileage) ? Math.max(Number(existing.mileage_km ?? mileage), mileage) : existing.mileage_km;
+    const distance = Number.isFinite(Number(startKm)) && Number.isFinite(Number(endKm)) && Number(endKm) >= Number(startKm)
+      ? Number(endKm) - Number(startKm) : existing.daily_distance_km;
+    await env.DB.prepare(
+      'UPDATE bmw_daily SET snapshot_timestamp=?, data_json=?, mileage_km=?, mileage_start_km=?, daily_distance_km=?, ' +
+      'fuel_percent=?, fuel_litres=?, range_km=?, updated_at=datetime("now") WHERE id=?'
+    ).bind(
+      fetchedAt, JSON.stringify(dataJson),
+      endKm ?? existing.mileage_km, startKm,
+      distance,
+      Number.isFinite(fuelPct) ? fuelPct : existing.fuel_percent,
+      Number.isFinite(fuelL) ? fuelL : existing.fuel_litres,
+      Number.isFinite(rangeKm) ? rangeKm : existing.range_km,
+      existing.id
+    ).run();
+  } else if (Object.keys(daily).length) {
+    const km = Number.isFinite(mileage) ? mileage : null;
+    await env.DB.prepare(
+      'INSERT INTO bmw_daily (snapshot_timestamp, snapshot_date, data_json, mileage_km, mileage_start_km, daily_distance_km, fuel_percent, fuel_litres, range_km, lock_state) ' +
+      'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+    ).bind(
+      fetchedAt, date, JSON.stringify(daily), km, km, 0,
+      Number.isFinite(fuelPct) ? fuelPct : null,
+      Number.isFinite(fuelL) ? fuelL : null,
+      Number.isFinite(rangeKm) ? rangeKm : null,
+      null
+    ).run();
+  }
+
+  return {descriptorCount:Object.keys(data).length, newestTimestamp:newestTs};
+}
+
 async function saveRaw(env, kind, vin, payload) {
   await env.DB.prepare(
     'INSERT INTO bmw_direct_raw (fetched_at, kind, vin, payload_json) VALUES (?, ?, ?, ?)'
