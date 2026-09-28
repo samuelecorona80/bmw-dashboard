@@ -2920,7 +2920,7 @@ function loadDashboard(manual=false){
       if(manual)$('refreshBtn').animate([{transform:'rotate(0deg)'},{transform:'rotate(360deg)'}],{duration:500});
     })
     .catch(err => {
-      $('loading').innerHTML=`<div class="error">Errore caricamento</div><div>${escapeHtml(err.message||String(err))}</div>`;
+      $('loading').innerHTML=\`<div class="error">Errore caricamento</div><div>\${escapeHtml(err.message||String(err))}</div>\`;
     });
 }
 function renderDataHealth(d,direct){
