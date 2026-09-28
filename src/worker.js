@@ -663,7 +663,9 @@ async function handleGetData(env, cors) {
 
   let milestone81000 = null;
   if (currentMileageEvent) {
-    const targetKm = 81000;
+    const targetKm = currentMileageEvent.km < 81000
+      ? 81000
+      : Math.ceil((currentMileageEvent.km + 1) / 10000) * 10000;
     const remainingKm = Math.max(0, targetKm - currentMileageEvent.km);
     const cutoff = Date.now() - 30 * 86400000;
     const recent = mileageEvents.filter(e => new Date(e.timestamp).getTime() >= cutoff && e.km <= currentMileageEvent.km);
@@ -2383,10 +2385,39 @@ function serveHistory() {
 // === Locations (Posizioni) ===
 async function serveLocationsData(env, cors) {
   const db = env.DB;
-  const current = await db.prepare("SELECT entity_id, value, bmw_timestamp FROM bmw_current WHERE entity_id IN ('vehicle.cabin.infotainment.navigation.currentLocation.latitude','vehicle.cabin.infotainment.navigation.currentLocation.longitude','vehicle.cabin.infotainment.navigation.currentLocation.heading')").all();
-  const history = await db.prepare("SELECT snapshot_timestamp, entity_id, state FROM bmw_raw_daily WHERE entity_id IN ('vehicle.cabin.infotainment.navigation.currentLocation.latitude','vehicle.cabin.infotainment.navigation.currentLocation.longitude') ORDER BY snapshot_timestamp ASC LIMIT 500").all();
+  const currentRows = await db.prepare("SELECT entity_id, value, bmw_timestamp, last_updated FROM bmw_current WHERE entity_id IN ('vehicle.cabin.infotainment.navigation.currentLocation.latitude','vehicle.cabin.infotainment.navigation.currentLocation.longitude','vehicle.cabin.infotainment.navigation.currentLocation.heading')").all();
+  const historyRows = await db.prepare("SELECT snapshot_timestamp, entity_id, state FROM bmw_raw_daily WHERE entity_id IN ('vehicle.cabin.infotainment.navigation.currentLocation.latitude','vehicle.cabin.infotainment.navigation.currentLocation.longitude') ORDER BY snapshot_timestamp ASC LIMIT 1000").all();
   const daily = await db.prepare("SELECT snapshot_date, mileage_km FROM bmw_daily WHERE mileage_km IS NOT NULL ORDER BY snapshot_date ASC").all();
-  return new Response(JSON.stringify({ current: current.results, history: history.results, daily: daily.results }), {
+
+  const currentLocation = {lat:null,lng:null,heading:null,timestamp:null,label:null,displayName:null};
+  for (const r of currentRows.results || []) {
+    if (r.entity_id.includes('latitude')) currentLocation.lat = Number(r.value);
+    if (r.entity_id.includes('longitude')) currentLocation.lng = Number(r.value);
+    if (r.entity_id.includes('heading')) currentLocation.heading = Number(r.value);
+    const stamp = r.bmw_timestamp || r.last_updated || null;
+    if (stamp && (!currentLocation.timestamp || Date.parse(stamp) > Date.parse(currentLocation.timestamp))) currentLocation.timestamp = stamp;
+  }
+  if (Number.isFinite(currentLocation.lat) && Number.isFinite(currentLocation.lng)) {
+    const place = await getLocationLabel(db,{lat:currentLocation.lat,lng:currentLocation.lng});
+    if (place) {
+      currentLocation.label = place.label || null;
+      currentLocation.displayName = place.displayName || place.label || null;
+    }
+  }
+
+  const grouped = new Map();
+  for (const r of historyRows.results || []) {
+    const key = r.snapshot_timestamp;
+    if (!grouped.has(key)) grouped.set(key,{ts:key,lat:null,lng:null});
+    const p = grouped.get(key);
+    if (r.entity_id.includes('latitude')) p.lat = Number(r.state);
+    if (r.entity_id.includes('longitude')) p.lng = Number(r.state);
+  }
+  const points = [...grouped.values()]
+    .filter(p => Number.isFinite(p.lat) && Number.isFinite(p.lng))
+    .sort((x,y) => Date.parse(x.ts)-Date.parse(y.ts));
+
+  return new Response(JSON.stringify({ current: currentRows.results, currentLocation, points, daily: daily.results }), {
     headers: { ...cors, 'Content-Type': 'application/json' }
   });
 }
@@ -2416,9 +2447,9 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 <main class="shell">
 <div id="mapLoc"></div>
 <div class="stats-row">
-<div class="stat-card"><small>Posizione attuale</small><strong id="sLat">\u2014</strong></div>
-<div class="stat-card"><small>Punti GPS</small><strong id="sCount">\u2014</strong></div>
-<div class="stat-card"><small>Ultimo agg.</small><strong id="sTime">\u2014</strong></div>
+<div class="stat-card"><small>Posizione attuale</small><strong id="sAddress">—</strong><div id="sLat" style="font-size:11px;color:var(--muted);margin-top:5px"></div><a id="mapsLink" href="#" target="_blank" rel="noopener" style="display:none;color:var(--accent);font-size:12px;text-decoration:none;margin-top:8px">Apri in Maps ↗</a></div>
+<div class="stat-card"><small>Punti GPS validi</small><strong id="sCount">—</strong></div>
+<div class="stat-card"><small>Ultimo dato posizione</small><strong id="sTime">—</strong><div id="sAge" style="font-size:11px;color:var(--muted);margin-top:5px"></div></div>
 </div>
 <div id="locList" class="loading">Caricamento posizioni...</div>
 </main>
@@ -2426,24 +2457,22 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 var map=L.map('mapLoc',{zoomControl:true,attributionControl:false}).setView([39.36,9.01],12);
 L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',{maxZoom:19}).addTo(map);
 fetch('/api/locations').then(function(r){return r.json()}).then(function(data){
-var cur={};
-(data.current||[]).forEach(function(c){
-if(c.entity_id.indexOf('latitude')>=0)cur.lat=parseFloat(c.value);
-if(c.entity_id.indexOf('longitude')>=0)cur.lng=parseFloat(c.value);
-if(c.entity_id.indexOf('heading')>=0)cur.heading=parseFloat(c.value);
-});
-if(cur.lat&&cur.lng){
-document.getElementById('sLat').textContent=cur.lat.toFixed(4)+'\u00b0N, '+cur.lng.toFixed(4)+'\u00b0E';
-var icon=L.divIcon({className:'',html:'<div style="font-size:28px;filter:drop-shadow(0 2px 4px rgba(0,0,0,.5))">\ud83d\ude97</div>',iconSize:[28,28],iconAnchor:[14,14]});
-L.marker([cur.lat,cur.lng],{icon:icon}).addTo(map).bindPopup('Posizione attuale');
+var cur=data.currentLocation||{};
+if(Number.isFinite(cur.lat)&&Number.isFinite(cur.lng)){
+document.getElementById('sAddress').textContent=cur.label||'Posizione BMW';
+document.getElementById('sLat').textContent=cur.lat.toFixed(4)+'°N, '+cur.lng.toFixed(4)+'°E';
+var ml=document.getElementById('mapsLink');
+ml.href='https://www.google.com/maps?q='+cur.lat+','+cur.lng; ml.style.display='inline-block';
+if(cur.timestamp){
+  var td=new Date(cur.timestamp), mins=Math.max(0,Math.round((Date.now()-td.getTime())/60000));
+  document.getElementById('sTime').textContent=td.toLocaleString('it-IT',{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'});
+  document.getElementById('sAge').textContent=mins<60?mins+' min fa':(mins<1440?Math.floor(mins/60)+' h fa':Math.floor(mins/1440)+' giorni fa');
+}
+var icon=L.divIcon({className:'',html:'<div style="font-size:28px;filter:drop-shadow(0 2px 4px rgba(0,0,0,.5))">🚗</div>',iconSize:[28,28],iconAnchor:[14,14]});
+L.marker([cur.lat,cur.lng],{icon:icon}).addTo(map).bindPopup(cur.label||'Posizione attuale');
 map.setView([cur.lat,cur.lng],14);
 }
-var pts=[],hist=data.history||[];
-for(var i=0;i<hist.length;i+=2){
-if(hist[i]&&hist[i+1]){
-var lat=parseFloat(hist[i].state),lng=parseFloat(hist[i+1].state);
-if(!isNaN(lat)&&!isNaN(lng))pts.push({lat:lat,lng:lng,ts:hist[i].snapshot_timestamp});
-}}
+var pts=(data.points||[]).filter(function(p){return Number.isFinite(p.lat)&&Number.isFinite(p.lng)});
 document.getElementById('sCount').textContent=pts.length+' punti';
 if(pts.length>1){
 var line=pts.map(function(p){return[p.lat,p.lng]});
@@ -2535,6 +2564,8 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 .trip-num{font-size:1.4rem;font-weight:700}
 .trip-label{font-size:.7rem;color:var(--muted);text-transform:uppercase}
 
+
+.pill-button{font:inherit;cursor:pointer}.attention-panel{margin-top:16px;padding:14px 18px;border:1px solid rgba(255,198,91,.38);background:rgba(255,198,91,.08);border-radius:16px}.attention-panel.alert{border-color:rgba(255,107,107,.48);background:rgba(255,107,107,.08)}.attention-title{font-weight:800;margin-bottom:7px}.attention-items{display:flex;gap:7px;flex-wrap:wrap}.health-panel{margin-top:12px;padding:16px 18px}.health-head{display:flex;justify-content:space-between;align-items:center;gap:10px}.health-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:9px;margin-top:12px}.health-item{border:1px solid rgba(74,112,148,.32);border-radius:12px;padding:10px 12px;background:rgba(7,18,30,.28)}.health-item small,.health-item strong{display:block}.health-item small{color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.06em}.health-item strong{margin-top:4px;font-size:13px}.secondary-block{margin-top:18px}.secondary-block>summary{cursor:pointer;color:#c9d8e8;font-weight:750;padding:14px 18px;border:1px solid rgba(74,112,148,.36);border-radius:14px;background:rgba(12,27,45,.62);list-style:none}.secondary-block>summary::-webkit-details-marker{display:none}.secondary-block>summary:after{content:' +';float:right;color:var(--blue)}.secondary-block[open]>summary:after{content:' −'}.secondary-block[open]>summary{margin-bottom:12px}@media(max-width:700px){.health-grid{grid-template-columns:1fr 1fr}}
 </style>
 
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
@@ -2571,9 +2602,9 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
           <p>Stato, percorrenza, consumi e manutenzione in un’unica vista.</p>
           <div class="hero-pills">
             <span class="pill" id="homePill">● Stato vettura</span>
-            <span class="pill" id="dataHealth" style="font-size:11px;padding:7px 10px">◌ Stato dati</span>
+            <button type="button" class="pill pill-button" id="dataHealth" onclick="toggleDataHealth()" style="font-size:11px;padding:7px 10px">◌ Stato dati</button>
             <span class="pill" id="tripBadge" style="display:none;background:var(--amber);color:#000;animation:pulse 1.5s infinite">🏎️ In viaggio</span>
-            <span class="pill">Aggiornamento giornaliero</span>
+            <span class="pill">Controllo automatico ogni ora</span>
              <a href="/vehicle-info" class="pill" style="text-decoration:none;background:rgba(67,142,255,.2);color:var(--accent)">📋 Scheda veicolo</a>
              <a href="/trips" class="pill" style="text-decoration:none;background:rgba(92,221,142,.2);color:var(--green)">🗺️ Viaggi</a>
              <a href="/fuel" class="pill" style="text-decoration:none;background:rgba(255,181,92,.2);color:#ffb55c">⛽ Carburante</a>
@@ -2621,6 +2652,15 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       </article>
     </section>
 
+    <section id="attentionPanel" class="attention-panel hidden">
+      <div class="attention-title" id="attentionTitle">Attenzione</div>
+      <div class="attention-items" id="attentionItems"></div>
+    </section>
+    <section id="dataHealthPanel" class="card health-panel hidden">
+      <div class="health-head"><div><div class="card-kicker" style="margin:0">BMW CarData · Data Health</div><div class="mini-note" id="healthSummary">Caricamento stato…</div></div><a href="/bmw-direct" style="color:var(--blue);text-decoration:none;font-size:12px">Dettagli tecnici →</a></div>
+      <div class="health-grid" id="healthGrid"></div>
+    </section>
+
     <section class="quick-stats" aria-label="Riepilogo rapido">
       <article class="quick-card"><span class="quick-icon">🛣️</span><div><small>Km oggi</small><strong id="quickKm">—</strong><em id="quickKmNote">ultimo intervallo giornaliero</em></div></article>
       <article class="quick-card"><span class="quick-icon">⛽</span><div><small>Consumo stimato</small><strong id="quickConsumption">—</strong><em id="quickConsumptionNote">km/L stimati</em></div></article>
@@ -2631,7 +2671,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 
     <section class="insight-grid">
       <article class="card insight-card"><div class="card-kicker">Ultimo incremento odometro</div><strong id="lastMoveDistance">—</strong><div class="mini-note" id="lastMoveNote">In attesa di dati odometro</div></article>
-      <article class="card insight-card"><div class="card-kicker">Checkpoint 81.000 km</div><strong id="milestoneRemaining">—</strong><div class="mini-note" id="milestoneNote">Stima in preparazione</div></article>
+      <article class="card insight-card"><div class="card-kicker">Prossimo promemoria chilometrico</div><strong id="milestoneRemaining">—</strong><div class="mini-note" id="milestoneNote">Stima in preparazione</div></article>
       <article class="card insight-card"><div class="card-kicker">Anomalie recenti</div><div id="anomalyList" class="mini-note">Analisi in corso…</div></article>
       <article class="card insight-card"><div class="card-kicker">Ultimo rifornimento rilevato</div><strong id="lastRefuel">—</strong><div class="mini-note" id="lastRefuelNote">Rilevamento stimato dal livello carburante</div></article>
     </section>
@@ -2645,7 +2685,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
         <div class="mini-note" id="fuelLastUpdate" style="margin-top:8px;font-size:0.78rem;color:var(--muted)">—</div>
       </article>
       <article class="card security-card" style="padding:24px">
-        <div class="card-kicker">Stato vettura</div>
+        <div class="card-kicker">Dettaglio chiusure</div>
         <div class="status-main" id="lockState">—</div>
         <div class="check-list">
           <div><b id="doorsIcon">✓</b><span id="doorsLabel">Porte chiuse</span><small id="doorsTs" style="display:block;color:var(--muted);font-size:0.7rem;margin-top:1px"></small></div>
@@ -2734,12 +2774,14 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       </article>
     </section>
 
-    <section class="extra-grid" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px;margin-top:24px">
+    <details class="secondary-block">
+      <summary>Altri dati BMW</summary>
+    <section class="extra-grid" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px;margin-top:0">
       <article class="card" style="padding:20px">
         <div class="card-kicker">🏎️ Stile di guida</div>
         <div id="tripModeContent" style="margin-top:12px">
           <div style="display:flex;gap:6px;align-items:center;margin-bottom:8px"><span style="width:12px;height:12px;border-radius:50%;background:#2ea55c;display:inline-block"></span><span style="font-size:13px">ECO Pro</span><strong id="tripEco" style="margin-left:auto">—</strong></div>
-          <div style="display:flex;gap:6px;align-items:center;margin-bottom:8px"><span style="width:12px;height:12px;border-radius:50%;background:#438eff;display:inline-block"></span><span style="font-size:13px">ECO Pro+</span><strong id="tripEcoPlus" style="margin-left:auto">—</strong></div>
+          <div id="tripEcoPlusRow" style="display:flex;gap:6px;align-items:center;margin-bottom:8px"><span style="width:12px;height:12px;border-radius:50%;background:#438eff;display:inline-block"></span><span style="font-size:13px">ECO Pro+</span><strong id="tripEcoPlus" style="margin-left:auto">—</strong></div>
           <div style="display:flex;gap:6px;align-items:center;margin-bottom:8px"><span style="width:12px;height:12px;border-radius:50%;background:#7b93a8;display:inline-block"></span><span style="font-size:13px">Normal</span><strong id="tripNormal" style="margin-left:auto">—</strong></div>
           <div style="height:8px;border-radius:4px;overflow:hidden;display:flex;margin-top:10px;background:rgba(39,71,102,.3)" id="tripBar">
             <div id="tripBarEco" style="background:#2ea55c;transition:width .5s"></div>
@@ -2783,6 +2825,8 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       </article>
     </section>
 
+    </details>
+
     <section class="charts-grid">
       <article class="card chart-card" style="padding:20px"><div class="card-kicker">Autonomia</div><canvas id="rangeChart"></canvas></article>
       <article class="card chart-card" style="padding:20px"><div class="card-kicker">Carburante</div><canvas id="fuelChart"></canvas></article>
@@ -2792,7 +2836,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     <footer class="footer">
       <div><strong>BMW X3 M40d</strong><span>Connected through BMW CarData</span></div>
       <div><strong>Dati giornalieri</strong><span><span id="entitiesCount">—</span> entità monitorate</span></div>
-      <div><strong>Aggiornamento automatico</strong><span>Ogni giorno alle 06:00</span></div>
+      <div><strong>Aggiornamento automatico</strong><span>Controllo ogni ora · dati aggiornati quando disponibili</span></div>
     </footer>
   </main>
 
@@ -2849,19 +2893,67 @@ function locationLabel(v){ const x=String(v||'').toLowerCase(); if(x==='home')re
 function climateLabel(v){ const labels={'INACTIVE':'Inattivo','ACTIVE':'Attivo','HEATING':'Riscaldamento','COOLING':'Raffreddamento','VENTILATION':'Ventilazione','OFF':'Spento'}; return labels[String(v||'')] || v || '—'; }
 function escapeHtml(s){ return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
+function toggleDataHealth(){
+  var p=$('dataHealthPanel'); if(p) p.classList.toggle('hidden');
+}
 function loadDashboard(manual=false){
   $('loading').classList.remove('hidden');
-  fetch('/api/data')
-    .then(r => r.json())
-    .then(data => {
+  Promise.all([
+    fetch('/api/data').then(r=>r.json()),
+    fetch('/api/bmw-direct/status').then(r=>r.ok?r.json():null).catch(()=>null)
+  ])
+    .then(([data,direct]) => {
       renderDashboard(data);
+      renderDataHealth(data,direct);
+      renderAttention(data,direct);
       selectPeriod(currentPeriod);
       $('loading').classList.add('hidden');
       if(manual)$('refreshBtn').animate([{transform:'rotate(0deg)'},{transform:'rotate(360deg)'}],{duration:500});
     })
     .catch(err => {
-      $('loading').innerHTML=\`<div class="error">Errore caricamento</div><div>\${escapeHtml(err.message||String(err))}</div>\`;
+      $('loading').innerHTML=`<div class="error">Errore caricamento</div><div>${escapeHtml(err.message||String(err))}</div>`;
     });
+}
+function renderDataHealth(d,direct){
+  var fs=d.freshness||{}, grid=$('healthGrid'), pill=$('dataHealth');
+  var areas=[['Odometro','odometer'],['Carburante','fuel'],['Pneumatici','tyres'],['Batteria 12V','battery'],['Posizione','location'],['Chiusure','security']];
+  var html=areas.map(function(a){
+    var x=fs[a[1]]||{}, st=x.status||'unknown';
+    var label=st==='fresh'?'Recente':(st==='stale'?'In ritardo':(st==='old'?'Vecchio':'N.d.'));
+    var col=st==='fresh'?'var(--green)':(st==='stale'?'var(--amber)':'var(--red)');
+    return '<div class="health-item"><small>'+a[0]+'</small><strong style="color:'+col+'">'+label+'</strong><div class="mini-note">'+(x.timestamp?escapeHtml(ageLabel(x.timestamp)):'Timestamp non disponibile')+'</div></div>';
+  }).join('');
+  if(direct){
+    var q=direct.apiQuota||{}, limited=Boolean(q.remoteRateLimitedAt);
+    var directState=limited?'Quota BMW esaurita':(direct.lastError?'Errore ultimo fetch':(direct.hasToken?'Connesso':'Non autorizzato'));
+    var col=limited||direct.lastError?'var(--red)':(direct.hasToken?'var(--green)':'var(--amber)');
+    html+='<div class="health-item"><small>BMW Direct</small><strong style="color:'+col+'">'+escapeHtml(directState)+'</strong><div class="mini-note">'+(direct.lastFetchAt?'Ultimo fetch '+escapeHtml(formatTimestamp(direct.lastFetchAt)):'Nessun fetch')+'</div></div>';
+    html+='<div class="health-item"><small>Quota locale</small><strong>'+((q.used??'—')+' / '+(q.limit??50))+'</strong><div class="mini-note">'+(limited?'BMW ha segnalato rate limit':'Tracking Worker ultime 24h')+'</div></div>';
+    html+='<div class="health-item"><small>Token</small><strong>'+(direct.expiresAt?escapeHtml(formatTimestamp(direct.expiresAt)):'N.d.')+'</strong><div class="mini-note">'+(direct.scope?'OAuth BMW attivo':'Scope non disponibile')+'</div></div>';
+    if(pill){pill.textContent=limited?'! Quota BMW esaurita':(direct.lastError?'! BMW Direct errore':'● BMW Direct');pill.style.color=col;pill.style.borderColor=col;}
+    $('healthSummary').textContent=limited?'BMW ha bloccato temporaneamente le REST API per rate limit.':(direct.lastError?'Ultimo fetch BMW con errore.':'Connessione diretta BMW monitorata dal Worker.');
+  } else if($('healthSummary')) $('healthSummary').textContent='Stato BMW Direct non disponibile.';
+  if(grid) grid.innerHTML=html;
+}
+function renderAttention(d,direct){
+  var items=[],q=direct&&direct.apiQuota;
+  if(q&&q.remoteRateLimitedAt) items.push({level:'alert',text:'BMW API: quota esaurita'});
+  if(d.tyres&&d.tyres.alerts&&d.tyres.alerts.any) items.push({level:'warn',text:'Pressione pneumatici fuori target'});
+  if(d.tyres&&d.tyres.trendAlerts&&d.tyres.trendAlerts.any) items.push({level:'warn',text:'Variazione pressione pneumatici'});
+  if(d.security){
+    if(d.security.doorsClosed===false) items.push({level:'alert',text:'Porte aperte'});
+    if(d.security.windowsClosed===false) items.push({level:'alert',text:'Finestrini aperti'});
+    if(d.security.hoodClosed===false) items.push({level:'alert',text:'Cofano aperto'});
+    if(d.security.tailgateClosed===false) items.push({level:'alert',text:'Portellone aperto'});
+    if(d.security.sunroofClosed===false) items.push({level:'alert',text:'Tetto apribile aperto'});
+  }
+  (d.anomalies||[]).forEach(function(x){if(x.severity==='alert'||x.severity==='warn')items.push({level:x.severity,text:x.text});});
+  var seen={},unique=items.filter(function(x){var k=String(x.text).toLowerCase();if(seen[k])return false;seen[k]=1;return true;});
+  var p=$('attentionPanel');if(!p)return;
+  if(!unique.length){p.classList.add('hidden');return;}
+  p.classList.remove('hidden');p.classList.toggle('alert',unique.some(x=>x.level==='alert'));
+  $('attentionTitle').textContent=unique.some(x=>x.level==='alert')?'Richiede attenzione':'Da controllare';
+  $('attentionItems').innerHTML=unique.map(function(x){return '<span class="fresh-chip '+(x.level==='alert'?'old':'stale')+'">'+(x.level==='alert'?'!':'⚠')+' '+escapeHtml(x.text)+'</span>';}).join('');
 }
 
 function renderDashboard(d){
@@ -2979,9 +3071,9 @@ function renderDashboard(d){
     $('milestoneRemaining').textContent=d.milestone81000.remainingKm>0?d.milestone81000.remainingKm.toLocaleString('it-IT')+' km':'Raggiunti';
     if(d.milestone81000.estimatedDate && d.milestone81000.remainingKm>0){
       var md=new Date(d.milestone81000.estimatedDate);
-      $('milestoneNote').textContent='~'+md.toLocaleDateString('it-IT',{day:'2-digit',month:'short'})+(d.milestone81000.avgKmPerDay?' · '+fmt1(d.milestone81000.avgKmPerDay)+' km/giorno':'')+(d.distanceThisMonthPartial?' · odometro parziale':'');
+      $('milestoneNote').textContent='Target '+fmtInt(d.milestone81000.targetKm)+' km · ~'+md.toLocaleDateString('it-IT',{day:'2-digit',month:'short'})+(d.milestone81000.avgKmPerDay?' · '+fmt1(d.milestone81000.avgKmPerDay)+' km/giorno':'')+(d.distanceThisMonthPartial?' · odometro parziale':'');
     }else{
-      $('milestoneNote').textContent=d.milestone81000.avgKmPerDay?fmt1(d.milestone81000.avgKmPerDay)+' km/giorno':'Serve più storico per stimare la data';
+      $('milestoneNote').textContent='Target '+fmtInt(d.milestone81000.targetKm)+' km · '+(d.milestone81000.avgKmPerDay?fmt1(d.milestone81000.avgKmPerDay)+' km/giorno':'serve più storico per stimare la data');
     }
   }
   if($('anomalyList')) $('anomalyList').innerHTML=(d.anomalies||[]).map(function(a){
@@ -3052,6 +3144,7 @@ function renderDashboard(d){
     var normal = Math.max(0, 100 - eco - ecoPlus - elec);
     $('tripEco').textContent = eco + '%';
     $('tripEcoPlus').textContent = ecoPlus + '%';
+    if($('tripEcoPlusRow')) $('tripEcoPlusRow').style.display=ecoPlus>0?'flex':'none';
     $('tripNormal').textContent = normal + '%';
     $('tripBarEco').style.width = eco + '%';
     $('tripBarEcoPlus').style.width = ecoPlus + '%';
