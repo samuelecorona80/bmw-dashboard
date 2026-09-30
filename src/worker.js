@@ -219,6 +219,7 @@ export default {
       if (path === '/api/prices') return servePrices(env, cors);
       if (path === '/update-price' && request.method === 'POST') return updatePrice(request, env, cors);
       if (path === '/vehicle-info') return serveVehicleInfo();
+      if (path === '/connection') return serveConnection();
       if (path === '/trips') return serveTrips();
       if (path === '/api/trips') return serveTripsData(env, cors);
       return serveDashboard();
@@ -253,6 +254,14 @@ function haversineKm(aLat,aLng,bLat,bLng){
   return 2*R*Math.asin(Math.sqrt(s));
 }
 
+
+function applyKnownPoi(label, displayName=''){
+  const s=(String(label||'')+' '+String(displayName||'')).toLowerCase();
+  if(s.includes('zinnibiri')) return '🏠 Casa';
+  if(s.includes('michele giua') || s.includes('via giua') || s.includes(' giua')) return '💼 Lavoro';
+  return label;
+}
+
 async function getLocationLabel(db, location){
   if(!location || !Number.isFinite(Number(location.lat)) || !Number.isFinite(Number(location.lng))) return null;
   try{
@@ -261,7 +270,8 @@ async function getLocationLabel(db, location){
     const key=lat.toFixed(4)+','+lng.toFixed(4);
     const cached=await db.prepare('SELECT label, display_name, fetched_at FROM bmw_geocode_cache WHERE cache_key=?').bind(key).first();
     if(cached && cached.fetched_at && Date.now()-Date.parse(cached.fetched_at)<7*86400000){
-      return {label:cached.label||cached.display_name, displayName:cached.display_name||cached.label, source:'cache'};
+      const cachedLabel=applyKnownPoi(cached.label||cached.display_name,cached.display_name||cached.label);
+      return {label:cachedLabel, displayName:cached.display_name||cached.label, source:'cache'};
     }
     const u='https://nominatim.openstreetmap.org/reverse?format=jsonv2&addressdetails=1&zoom=18&lat='+encodeURIComponent(lat)+'&lon='+encodeURIComponent(lng);
     const r=await fetch(u,{headers:{'Accept':'application/json','Accept-Language':'it','User-Agent':'samuele-bmw-dashboard/1.0'}});
@@ -296,6 +306,7 @@ async function getLocationLabel(db, location){
     }
     if(label && locality && !String(label).includes(locality)) label += ' · '+locality;
     if(!label) label=x.display_name||null;
+    label=applyKnownPoi(label,x.display_name||label);
     const fetchedAt=new Date().toISOString();
     await db.prepare('INSERT INTO bmw_geocode_cache(cache_key,lat,lng,label,display_name,fetched_at) VALUES(?,?,?,?,?,?) ON CONFLICT(cache_key) DO UPDATE SET lat=excluded.lat,lng=excluded.lng,label=excluded.label,display_name=excluded.display_name,fetched_at=excluded.fetched_at')
       .bind(key,lat,lng,label,x.display_name||label,fetchedAt).run();
@@ -755,7 +766,7 @@ async function handleGetData(env, cors) {
     rearLeft: delta(tyres.rearLeft, previousTyreValue('rlBar')),
     rearRight: delta(tyres.rearRight, previousTyreValue('rrBar'))
   };
-  const trendFlags = Object.fromEntries(Object.entries(tyreTrend).map(([k,v]) => [k, v !== null && Math.abs(v) >= 0.2]));
+  const trendFlags = Object.fromEntries(Object.entries(tyreTrend).map(([k,v]) => [k, v !== null && v <= -0.3]));
   tyres.trend = tyreTrend;
   tyres.trendAlerts = { ...trendFlags, any: Object.values(trendFlags).some(Boolean) };
 
@@ -879,7 +890,7 @@ async function handleGetData(env, cors) {
   if(freshness.odometer.status==='old') anomalies.push({severity:'warn',text:'Odometro non aggiornato da oltre 24 ore',timestamp:freshness.odometer.timestamp});
   if(freshness.battery.status==='old') anomalies.push({severity:'info',text:'Stato batteria 12V non recente',timestamp:freshness.battery.timestamp});
   if(freshness.security.status==='old') anomalies.push({severity:'info',text:'Stato chiusura vettura non recente',timestamp:freshness.security.timestamp});
-  if(tyres.trendAlerts?.any) anomalies.push({severity:'warn',text:'Variazione pressione ≥0,2 bar rilevata',timestamp:tyres.bmwTimestamp});
+  if(tyres.trendAlerts?.any) anomalies.push({severity:'warn',text:'Calo pressione ≥0,3 bar rilevato',timestamp:tyres.bmwTimestamp});
   if(tyres.alerts?.any) anomalies.push({severity:'alert',text:'Pressione pneumatici fuori target',timestamp:tyres.bmwTimestamp});
   if(String(state('sensor.x3_m40d_doors_overall_state')||'').toUpperCase()==='UNLOCKED' && freshness.security.status!=='old' && freshness.security.status!=='unknown') anomalies.push({severity:'alert',text:'Vettura sbloccata',timestamp:lockFreshTs});
   const severityOrder={alert:0,warn:1,info:2,ok:3};
@@ -2499,6 +2510,34 @@ setTimeout(function(){map.invalidateSize()},200);
   return new Response(html, { headers: { 'Content-Type': 'text/html;charset=utf-8' } });
 }
 
+
+function serveConnection(){
+  const html=`<!doctype html><html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>BMW X3 M40d · Connessione</title>
+  <style>
+  :root{--bg:#07111d;--card:#0c1b2d;--line:#274766;--text:#f4f7fb;--muted:#9fb2c7;--green:#64e78b;--amber:#ffc65b;--red:#ff6b6b;--blue:#3f8cff}
+  *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.shell{max-width:900px;margin:auto;padding:24px}.top{display:flex;justify-content:space-between;align-items:center;margin-bottom:22px}.top a{color:var(--blue);text-decoration:none}.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px;margin:12px 0}.flow{font-size:18px;font-weight:800;line-height:1.7}.muted{color:var(--muted);font-size:13px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}.item{border:1px solid var(--line);border-radius:10px;padding:12px}.item small{display:block;color:var(--muted);text-transform:uppercase;font-size:10px}.item strong{display:block;margin-top:5px}.ok{color:var(--green)}.warn{color:var(--amber)}.bad{color:var(--red)}
+  </style></head><body><main class="shell"><div class="top"><a href="/">← Dashboard</a><h1>🔌 Connessione dati</h1></div>
+  <div class="card"><div class="flow">BMW CarData → BavarianData → Home Assistant → D1 → Dashboard</div><div class="muted">Questa pagina contiene le informazioni tecniche; la dashboard principale mostra solo i dati utili dell'auto.</div></div>
+  <div class="card"><div class="grid" id="summary"><div class="muted">Caricamento…</div></div></div>
+  <div class="card"><h3>Qualità dati</h3><div class="grid" id="fresh"></div></div>
+  <div class="card"><h3>BMW Direct</h3><div class="muted" id="direct">Fallback manuale, nessun polling automatico.</div></div>
+  </main><script>
+  function age(ts){if(!ts)return 'n.d.';var m=Math.max(0,Math.round((Date.now()-new Date(ts).getTime())/60000));return m<60?m+' min fa':Math.floor(m/60)+' h fa'}
+  function dt(ts){return ts?new Date(ts).toLocaleString('it-IT',{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'}):'n.d.'}
+  Promise.all([fetch('/api/data').then(r=>r.json()),fetch('/api/bmw-direct/status').then(r=>r.ok?r.json():null).catch(()=>null)]).then(([d,b])=>{
+    var pipe=d.freshness&&d.freshness.pipeline||{};var bmw=d.core&&d.core.mileageUpdatedAt;
+    document.getElementById('summary').innerHTML='<div class="item"><small>Ultimo dato BMW</small><strong>'+dt(bmw)+'</strong><span class="muted">'+age(bmw)+'</span></div>'+
+      '<div class="item"><small>Ultimo sync HA → D1</small><strong>'+dt(pipe.timestamp)+'</strong><span class="muted">'+age(pipe.timestamp)+'</span></div>'+
+      '<div class="item"><small>Sorgente primaria</small><strong class="ok">Home Assistant</strong><span class="muted">BavarianData</span></div>';
+    var names={odometer:'Odometro',fuel:'Carburante',tyres:'Pneumatici',battery:'Batteria 12V',location:'Posizione',security:'Chiusure'};
+    document.getElementById('fresh').innerHTML=Object.keys(names).map(k=>{var x=d.freshness&&d.freshness[k]||{};var cls=x.status==='fresh'?'ok':x.status==='stale'?'warn':'bad';return '<div class="item"><small>'+names[k]+'</small><strong class="'+cls+'">'+(x.status||'n.d.')+'</strong><span class="muted">'+age(x.timestamp)+'</span></div>'}).join('');
+    if(b){var q=b.apiQuota||{};document.getElementById('direct').innerHTML='Fallback manuale · richieste Worker ultime 24h: <strong>'+(q.used??'—')+'</strong>'+(b.lastFetchAt?' · ultimo test '+dt(b.lastFetchAt):' · nessun fetch automatico');}
+  }).catch(e=>{document.getElementById('summary').textContent='Errore: '+e.message});
+  <\/script></body></html>`;
+  return new Response(html,{headers:{'Content-Type':'text/html;charset=utf-8'}});
+}
+
 function serveDashboard() {
   return new Response(DASHBOARD_HTML, {
     headers: { 'Content-Type': 'text/html;charset=utf-8' }
@@ -2601,7 +2640,6 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
           <div class="eyebrow">Ultimo dato BMW</div>
           <div class="time" id="lastBmw">—</div>
           <div class="freshness" id="freshness"><i></i> Caricamento…</div>
-          <div class="mini-note" style="margin-top:4px">Sync HA → D1: <strong id="lastHaSync">—</strong></div>
         </div>
         <button class="refresh" id="refreshBtn" onclick="loadDashboard(true)" title="Aggiorna">↻</button>
       </div>
@@ -2614,19 +2652,16 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
           <h1>Stato vettura<br><span>e utilizzo</span></h1>
           <p>Chilometri, carburante, posizione, pneumatici e manutenzione.</p>
           <div class="hero-pills">
-            <span class="pill" id="homePill">● Stato vettura</span>
-            <button type="button" class="pill pill-button" id="dataHealth" onclick="toggleDataHealth()" style="font-size:11px;padding:7px 10px">◌ Stato dati</button>
             <span class="pill" id="tripBadge" style="display:none;background:var(--amber);color:#000;animation:pulse 1.5s infinite">🏎️ In viaggio</span>
-            <span class="pill">Aggiornamento via Home Assistant</span>
              <a href="/vehicle-info" class="pill" style="text-decoration:none;background:rgba(67,142,255,.2);color:var(--accent)">📋 Scheda veicolo</a>
              <a href="/trips" class="pill" style="text-decoration:none;background:rgba(92,221,142,.2);color:var(--green)">🗺️ Viaggi</a>
              <a href="/fuel" class="pill" style="text-decoration:none;background:rgba(255,181,92,.2);color:#ffb55c">⛽ Carburante</a>
              <a href="/locations" class="pill" style="text-decoration:none;background:rgba(147,112,219,.2);color:#9370db">📍 Posizioni</a>
              <a href="/history" class="pill" style="text-decoration:none;background:rgba(255,152,0,.2);color:#ff9800">📜 Cronologia</a>
+             <a href="/connection" class="pill" style="text-decoration:none;background:rgba(100,231,139,.12);color:var(--green)">🔌 Connessione</a>
              <a href="/logout" class="pill hero-logout" style="text-decoration:none">Esci</a>
           </div>
           <div id="heroStats" style="margin-top:12px;font-size:13px;color:var(--muted);display:flex;flex-wrap:wrap;gap:8px 16px">
-            <span id="heroLock" style="padding:2px 10px;border-radius:12px;font-weight:700">🔒 —</span>
             <span>🛣️ <strong id="heroKm">—</strong> km</span>
             <span>⛽ <strong id="heroFuel">—</strong></span>
             <span>📅 <strong id="heroMonthKm">—</strong> km questo mese <small id="heroMonthFreshness" style="color:var(--muted)"></small></span>
@@ -2669,14 +2704,8 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       <div class="attention-title" id="attentionTitle">Attenzione</div>
       <div class="attention-items" id="attentionItems"></div>
     </section>
-    <section id="dataHealthPanel" class="card health-panel hidden">
-      <div class="health-head"><div><div class="card-kicker" style="margin:0">BMW CarData · Data Health</div><div class="mini-note" id="healthSummary">Caricamento stato…</div></div><a href="/bmw-direct" style="color:var(--blue);text-decoration:none;font-size:12px">Dettagli tecnici →</a></div>
-      <div class="health-grid" id="healthGrid"></div>
-    </section>
-
     <section class="quick-stats" aria-label="Riepilogo rapido">
       <article class="quick-card"><span class="quick-icon">🛣️</span><div><small>Km oggi</small><strong id="quickKm">—</strong><em id="quickKmNote">ultimo intervallo giornaliero</em></div></article>
-      <article class="quick-card"><span class="quick-icon">⛽</span><div><small>Consumo stimato</small><strong id="quickConsumption">—</strong><em id="quickConsumptionNote">km/L stimati</em></div></article>
       <article class="quick-card"><span class="quick-icon">🌿</span><div><small>ECO Pro</small><strong id="quickEco">—</strong><em id="quickEcoNote">ultimo trip BMW</em></div></article>
       <article class="quick-card"><span class="quick-icon">💰</span><div><small>Costo/km</small><strong id="quickCostKm">—</strong><em id="quickCostNote">€ al km stimato</em></div></article>
       <article class="quick-card"><span class="quick-icon">🅿️</span><div><small>Ultima posizione</small><strong id="quickStatus">—</strong><em id="quickStatusNote">ultima posizione BMW</em></div></article>
@@ -2911,14 +2940,10 @@ function toggleDataHealth(){
 }
 function loadDashboard(manual=false){
   $('loading').classList.remove('hidden');
-  Promise.all([
-    fetch('/api/data').then(r=>r.json()),
-    fetch('/api/bmw-direct/status').then(r=>r.ok?r.json():null).catch(()=>null)
-  ])
-    .then(([data,direct]) => {
+  fetch('/api/data').then(r=>r.json())
+    .then(data => {
       renderDashboard(data);
-      renderDataHealth(data,direct);
-      renderAttention(data,direct);
+      renderAttention(data,null);
       selectPeriod(currentPeriod);
       $('loading').classList.add('hidden');
       if(manual)$('refreshBtn').animate([{transform:'rotate(0deg)'},{transform:'rotate(360deg)'}],{duration:500});
@@ -2949,7 +2974,7 @@ function renderDataHealth(d,direct){
 function renderAttention(d,direct){
   var items=[];
   if(d.tyres&&d.tyres.alerts&&d.tyres.alerts.any) items.push({level:'warn',text:'Pressione pneumatici fuori target'});
-  if(d.tyres&&d.tyres.trendAlerts&&d.tyres.trendAlerts.any) items.push({level:'warn',text:'Variazione pressione pneumatici'});
+  if(d.tyres&&d.tyres.trendAlerts&&d.tyres.trendAlerts.any) items.push({level:'warn',text:'Calo pressione pneumatici'});
   if(d.security){
     if(d.security.doorsClosed===false) items.push({level:'alert',text:'Porte aperte'});
     if(d.security.windowsClosed===false) items.push({level:'alert',text:'Finestrini aperti'});
@@ -2976,11 +3001,6 @@ function renderDashboard(d){
   var mileageTs=d.core.mileageUpdatedAt||d.core.lastBmwTimestamp;
   $('lastBmw').textContent=dateTime(mileageTs);
   var pipeFresh=(d.freshness&&d.freshness.pipeline)||{status:'unknown',timestamp:null};
-  if($('lastHaSync')){
-    var syncAge=pipeFresh.timestamp?ageLabel(pipeFresh.timestamp).replace('Dato BMW: ','').replace('Dato BMW appena aggiornato','adesso'):'';
-    $('lastHaSync').textContent=pipeFresh.timestamp?formatTimestamp(pipeFresh.timestamp)+' · sync '+syncAge:'non disponibile';
-    $('lastHaSync').style.color=pipeFresh.status==='fresh'?'var(--green)':(pipeFresh.status==='stale'?'var(--amber)':'var(--red)');
-  }
   var odFresh=(d.freshness&&d.freshness.odometer)||{status:'unknown'};
   $('freshness').className='freshness '+(odFresh.status||'unknown');
   $('freshness').style.color=odFresh.status==='fresh'?'var(--green)':(odFresh.status==='stale'?'var(--amber)':'var(--red)');
@@ -2988,21 +3008,6 @@ function renderDashboard(d){
   if(freshnessDot) freshnessDot.style.background=odFresh.status==='fresh'?'var(--green)':(odFresh.status==='stale'?'var(--amber)':'var(--red)');
   $('freshness').innerHTML='<i></i>'+escapeHtml('Odometro · '+ageLabel(mileageTs).replace('Dato BMW appena aggiornato','appena aggiornato').replace('Dato BMW: ',''));
   $('homePill').textContent=\`● \${locationLabel(d.core.locationState)}\`;
-  if($('dataHealth')){
-    var fs=d.freshness||{};
-    var keys=['odometer','fuel','tyres','battery','location','security'];
-    var vals=keys.map(function(k){return fs[k]}).filter(Boolean), total=keys.length;
-    var recent=vals.filter(function(x){return x&&x.status==='fresh';}).length;
-    var pipe=fs.pipeline||{status:'unknown',timestamp:null};
-    var pipeOk=pipe.status==='fresh';
-    var pipeStale=pipe.status==='stale';
-    var stateColor=pipeOk?'var(--green)':(pipeStale?'var(--amber)':'var(--red)');
-    var prefix=pipeOk?'Flusso attivo':(pipeStale?'Flusso in ritardo':'Flusso dati fermo');
-    $('dataHealth').textContent='● '+prefix+' · '+recent+'/'+total+' dati recenti';
-    $('dataHealth').style.color=stateColor;
-    $('dataHealth').style.borderColor=stateColor;
-    $('dataHealth').title=pipe.timestamp?('Ultimo invio: '+formatTimestamp(pipe.timestamp)):'Ultimo invio non disponibile';
-  }
   // Status banner rendering
   var lkV = (d.security.lockState || '').toUpperCase();
   var lockKnown = ['LOCKED','SECURED','UNLOCKED'].includes(lkV);
@@ -3017,8 +3022,6 @@ function renderDashboard(d){
   if($('sBHood')) $('sBHood').innerHTML = mark(d.security.hoodClosed)+'Cofano';
   if($('sBTrunk')) $('sBTrunk').innerHTML = mark(d.security.tailgateClosed)+'Portellone';
   if($('sBSunroof')) $('sBSunroof').innerHTML = mark(d.security.sunroofClosed)+'Tetto';
-  if($('heroLock')) { $('heroLock').style.background=!lockKnown?'rgba(242,184,75,.16)':(isLk?'rgba(46,165,92,.2)':'rgba(255,87,87,.2)'); $('heroLock').style.color=!lockKnown?'#f2b84b':(isLk?'#5cf29c':'#ff5757'); $('heroLock').innerHTML=(!lockKnown?'❔':(isLk?'🔒':'🔓'))+' <strong>'+(!lockKnown?'Serratura n.d.':(isLk?'Bloccata':'Sbloccata'))+'</strong>'; }
-
   // Hero stats
   if(d.core.mileageKm) $('heroKm').textContent=fmtInt(d.core.mileageKm);
   if(d.core.fuelPercent!=null) $('heroFuel').textContent=fmtInt(d.core.fuelPercent)+'% ('+( d.core.fuelLitres||'—')+'L) · '+(d.core.rangeKm||'—')+' km';
@@ -3203,15 +3206,15 @@ function renderQuickStats(d){
     var src=d.quick.dailyKmSource?(' · '+d.quick.dailyKmSource):'';
     $('quickKmNote').textContent='distanza odierna'+src;
   }
-  $('quickConsumption').textContent=(d.quick.consumptionKmL===null||!(d.quick.consumptionKmL>0))?'—':fmt1(d.quick.consumptionKmL)+' km/L';
+  if($('quickConsumption')) $('quickConsumption').textContent=(d.quick.consumptionKmL===null||!(d.quick.consumptionKmL>0))?'—':fmt1(d.quick.consumptionKmL)+' km/L';
   var cq=d.consumptionQuality||{};
   if(d.quick.consumptionKmL!==null){
-    $('quickConsumptionNote').textContent=(d.quick.consumptionSource||'BMW')+
+    if($('quickConsumptionNote')) $('quickConsumptionNote').textContent=(d.quick.consumptionSource||'BMW')+
       (d.quick.consumptionSource==='stima storica'
         ? ' · '+(cq.samples||0)+' campioni · '+fmtInt(cq.coveredKm||0)+' km coperti'
         : '');
   }else{
-    $('quickConsumptionNote').textContent=(cq.samples||0)+' campioni validi · '+fmtInt(cq.coveredKm||0)+' km coperti · servono almeno 4 campioni / 200 km';
+    if($('quickConsumptionNote')) $('quickConsumptionNote').textContent=(cq.samples||0)+' campioni validi · '+fmtInt(cq.coveredKm||0)+' km coperti · servono almeno 4 campioni / 200 km';
   }
   $('quickEco').textContent=\`\${fmtInt(d.quick.ecoProPercent)}%\`;
   $('quickStatus').textContent=d.quick.vehicleState||'—';
@@ -3263,11 +3266,11 @@ function renderTyres(t){
   defs.forEach(([suffix,key,short])=>{
     const targetAlert=Boolean(t.alerts&&t.alerts[key]); const trendAlert=Boolean(t.trendAlerts&&t.trendAlerts[key]); const alert=targetAlert||trendAlert;
     const drift=t.trend&&t.trend[key]; if($(short+'Trend')) $(short+'Trend').textContent=drift===null||drift===undefined?'—':((drift>0?'+':'')+fmt1(drift)+' bar');
-    const box=$(\`tyre\${suffix}\`),badge=$(short+'Alert'); box.classList.toggle('pressure-alert',alert); badge.classList.toggle('alert',alert); badge.textContent=targetAlert?'TARGET':trendAlert?'Δ 0,2+':'OK';
+    const box=$(\`tyre\${suffix}\`),badge=$(short+'Alert'); box.classList.toggle('pressure-alert',alert); badge.classList.toggle('alert',alert); badge.textContent=targetAlert?'TARGET':trendAlert?'CALO':'OK';
   });
   const targetAny=Boolean(t.alerts&&t.alerts.any),trendAny=Boolean(t.trendAlerts&&t.trendAlerts.any);
   $('tyreAlertSummary').classList.toggle('hidden',!(targetAny||trendAny));
-  $('tyreAlertSummary').textContent=targetAny?'⚠ Pressione fuori target di oltre 0,5 bar':trendAny?'⚠ Variazione di almeno 0,2 bar rispetto alla precedente rilevazione':'';
+  $('tyreAlertSummary').textContent=targetAny?'⚠ Pressione fuori target di oltre 0,5 bar':trendAny?'⚠ Calo di almeno 0,3 bar rispetto alla precedente rilevazione':'';
 }
 
 function buildBaseCharts(history,tyres){
@@ -3305,10 +3308,7 @@ let dashboardRefreshTimer=null;
 window.addEventListener('load',()=>{
   initPeriodSelectors();
   loadDashboard(false);
-  dashboardRefreshTimer=setInterval(()=>{ if(!document.hidden) loadDashboard(false); },5*60*1000);
-});
-document.addEventListener('visibilitychange',()=>{
-  if(!document.hidden) loadDashboard(false);
+  dashboardRefreshTimer=setInterval(()=>{ if(!document.hidden) loadDashboard(false); },15*60*1000);
 });
 
 
