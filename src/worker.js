@@ -521,6 +521,66 @@ async function upsertDaily(db, snapshotTs, snapshotDate, entities) {
   }
 }
 
+
+async function detectRefuels(db, limit=20){
+  try{
+    const rows=await db.prepare(
+      `SELECT snapshot_timestamp, entity_id, state, bmw_timestamp
+       FROM bmw_raw_daily
+       WHERE entity_id IN ('sensor.x3_m40d_range_tank_level_2','vehicle.drivetrain.fuelSystem.remainingFuel')
+       ORDER BY snapshot_timestamp ASC LIMIT 2000`
+    ).all();
+    const groups={};
+    for(const r of rows.results){
+      const v=Number(String(r.state).replace(',','.'));
+      if(!Number.isFinite(v)||v<0||v>100)continue;
+      (groups[r.entity_id]||(groups[r.entity_id]=[])).push({ts:r.bmw_timestamp||r.snapshot_timestamp,litres:v});
+    }
+    const preferred=(groups['sensor.x3_m40d_range_tank_level_2']||[]).length>=2
+      ? groups['sensor.x3_m40d_range_tank_level_2']
+      : (groups['vehicle.drivetrain.fuelSystem.remainingFuel']||[]);
+    if(preferred.length<2)return [];
+
+    const mileageRows=await db.prepare(
+      `SELECT snapshot_timestamp, state, bmw_timestamp
+       FROM bmw_raw_daily
+       WHERE entity_id='sensor.x3_m40d_vehicle_mileage'
+       ORDER BY snapshot_timestamp ASC LIMIT 2000`
+    ).all();
+    const mileage=mileageRows.results.map(r=>({ts:r.bmw_timestamp||r.snapshot_timestamp,km:Number(r.state)}))
+      .filter(x=>Number.isFinite(x.km)&&x.km>0);
+    const mileageNear=ts=>{
+      const t=Date.parse(ts);let best=null,bestD=Infinity;
+      for(const m of mileage){const d=Math.abs(Date.parse(m.ts)-t);if(d<bestD){best=m;bestD=d}}
+      return bestD<=6*3600000?best:null;
+    };
+
+    const clean=[];
+    for(const p of preferred){
+      const last=clean[clean.length-1];
+      if(last&&Math.abs(last.litres-p.litres)<0.05)continue;
+      clean.push(p);
+    }
+    const out=[];
+    for(let i=1;i<clean.length;i++){
+      const prev=clean[i-1],cur=clean[i];
+      const added=cur.litres-prev.litres;
+      if(added>=5){
+        const m=mileageNear(cur.ts);
+        out.push({
+          timestamp:cur.ts,
+          litresEstimated:Math.round(added*10)/10,
+          beforeLitres:Math.round(prev.litres*10)/10,
+          afterLitres:Math.round(cur.litres*10)/10,
+          odometerKm:m?m.km:null,
+          source:'BMW fuel level'
+        });
+      }
+    }
+    return out.slice(-limit).reverse();
+  }catch(_){return []}
+}
+
 // ─────────────────────────────────────────────
 // GET /api/data — Dashboard payload
 // ─────────────────────────────────────────────
@@ -783,12 +843,16 @@ async function handleGetData(env, cors) {
 
   // Analytics from history
   const analytics = computeDailyAnalytics(history);
-  const refuels=[];
-  for(let i=1;i<history.length;i++){
-    const prev=history[i-1],curr=history[i],a=resolveFuelLitres(prev),b=resolveFuelLitres(curr);
-    if(a===null||b===null) continue;
-    const added=b-a;
-    if(added>=8) refuels.push({timestamp:curr.timestamp,litresEstimated:Math.round(added*10)/10,odometerKm:curr.mileageKm});
+  let refuels=await detectRefuels(db,10);
+  if(!refuels.length){
+    const fallback=[];
+    for(let i=1;i<history.length;i++){
+      const prev=history[i-1],curr=history[i],a=resolveFuelLitres(prev),b=resolveFuelLitres(curr);
+      if(a===null||b===null) continue;
+      const added=b-a;
+      if(added>=8) fallback.push({timestamp:curr.timestamp,litresEstimated:Math.round(added*10)/10,odometerKm:curr.mileageKm,source:'snapshot giornaliero'});
+    }
+    refuels=fallback.reverse();
   }
   const consumptionPoints=(analytics.consumption&&analytics.consumption.points)||[];
   const consumptionCoveredKm=consumptionPoints.reduce((s,p)=>s+(Number(p.deltaKm)||0),0);
@@ -977,7 +1041,7 @@ async function handleGetData(env, cors) {
     location: locationCoords ? { ...locationCoords, timestamp: locationTimestamp, label: locationLabel?.label || null, displayName: locationLabel?.displayName || null } : null,
     lastMovement,
     milestone81000,
-    refuels:{count:refuels.length,last:refuels.length?refuels[refuels.length-1]:null,recent:refuels.slice(-5).reverse()},
+    refuels:{count:refuels.length,last:refuels.length?refuels[0]:null,recent:refuels.slice(0,5)},
     freshness,
     anomalies,
     consumptionQuality:{confidence:consumptionConfidence,coveredKm:Math.round(consumptionCoveredKm),samples:consumptionPoints.length},
@@ -1726,6 +1790,7 @@ fetch('/api/trips').then(r=>r.json()).then(data=>{
 
 async function serveFuelData(env, cors) {
   const db = env.DB;
+  const refuels = await detectRefuels(db,50);
   const daily = await db.prepare(
     'SELECT snapshot_date, mileage_km, mileage_start_km, daily_distance_km, fuel_percent, fuel_litres, range_km, refuel_litres, refuel_cost_eur, diesel_price_eur FROM bmw_daily ORDER BY snapshot_date ASC'
   ).all();
@@ -1736,7 +1801,8 @@ async function serveFuelData(env, cors) {
     prices: prices.results, 
     dieselPrice: latestPrice.price_eur, 
     dieselPriceDate: latestPrice.date,
-    dieselPriceSource: latestPrice.source || 'default'
+    dieselPriceSource: latestPrice.source || 'default',
+    refuels
   }), {
     headers: { ...cors, 'Content-Type': 'application/json' }
   });
@@ -3008,8 +3074,8 @@ function renderDashboard(d){
     if(d.refuels&&d.refuels.last){
       $('lastRefuel').textContent='~'+fmt1(d.refuels.last.litresEstimated)+' L';
       var rd=new Date(d.refuels.last.timestamp);
-      var rdate=Number.isNaN(rd.getTime())?'data n.d.':rd.toLocaleDateString('it-IT',{day:'2-digit',month:'short',year:'numeric'});
-      $('lastRefuelNote').textContent=rdate+(d.refuels.last.odometerKm?' · '+fmtInt(d.refuels.last.odometerKm)+' km':'')+' · stima da variazione livello';
+      var rdate=Number.isNaN(rd.getTime())?'data n.d.':rd.toLocaleString('it-IT',{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'});
+      $('lastRefuelNote').textContent=rdate+(d.refuels.last.odometerKm?' · '+fmtInt(d.refuels.last.odometerKm)+' km':'')+' · '+(d.refuels.last.source==='BMW fuel level'?'rilevato dal livello BMW':'stima da snapshot');
     }else{
       $('lastRefuel').textContent='—';
       $('lastRefuelNote').textContent='Nessun rifornimento ≥8 L rilevato nei dati disponibili';
