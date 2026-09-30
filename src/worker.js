@@ -826,7 +826,8 @@ async function handleGetData(env, cors) {
     rearLeft: delta(tyres.rearLeft, previousTyreValue('rlBar')),
     rearRight: delta(tyres.rearRight, previousTyreValue('rrBar'))
   };
-  const trendFlags = Object.fromEntries(Object.entries(tyreTrend).map(([k,v]) => [k, v !== null && v <= -0.3]));
+  // Ignore normal thermal swings; alert only on a meaningful pressure drop.
+  const trendFlags = Object.fromEntries(Object.entries(tyreTrend).map(([k,v]) => [k, v !== null && v <= -0.4]));
   tyres.trend = tyreTrend;
   tyres.trendAlerts = { ...trendFlags, any: Object.values(trendFlags).some(Boolean) };
 
@@ -1694,21 +1695,24 @@ async function buildDetailedTrips(db, days=90){
 
   const trips=[];
   let pending=null;
+  const closeTrip=(startEv,endTs,status='complete')=>{
+    const sm=mileageAt(startEv.ts,false), em=mileageAt(endTs,true);
+    const dist=sm&&em&&em.km>=sm.km&&em.km-sm.km<500?Math.round((em.km-sm.km)*10)/10:null;
+    const dur=Math.max(0,Math.round((Date.parse(endTs)-Date.parse(startEv.ts))/60000));
+    trips.push({
+      startTs:startEv.ts,endTs,status,
+      startKm:sm?sm.km:null,endKm:em?em.km:null,distanceKm:dist,durationMin:dur,
+      startLocation:nearestLoc(startEv.ts),endLocation:nearestLoc(endTs)
+    });
+  };
   for(const ev of events){
     if(ev.trigger==='trip_start'){
-      if(!pending) pending=ev;
-      else pending=ev; // a new start closes the old unmatched start logically
+      if(pending) closeTrip(pending,ev.ts,'complete_inferred');
+      pending=ev;
       continue;
     }
     if(ev.trigger==='trip_end'&&pending){
-      const sm=mileageAt(pending.ts,false), em=mileageAt(ev.ts,true);
-      const dist=sm&&em&&em.km>=sm.km&&em.km-sm.km<500?Math.round((em.km-sm.km)*10)/10:null;
-      const dur=Math.max(0,Math.round((Date.parse(ev.ts)-Date.parse(pending.ts))/60000));
-      trips.push({
-        startTs:pending.ts,endTs:ev.ts,status:'complete',
-        startKm:sm?sm.km:null,endKm:em?em.km:null,distanceKm:dist,durationMin:dur,
-        startLocation:nearestLoc(pending.ts),endLocation:nearestLoc(ev.ts)
-      });
+      closeTrip(pending,ev.ts,'complete');
       pending=null;
     }
   }
@@ -1775,7 +1779,7 @@ fetch('/api/trips').then(r=>r.json()).then(data=>{
  var trips=data.trips||[];var list=document.getElementById('list');
  if(!trips.length){list.innerHTML='<div class="empty">Nessun viaggio registrato</div>';return}
  list.innerHTML=trips.map(t=>{
-   var status=t.status==='in_progress'?'<span class="badge">in corso</span>':'';
+   var status=t.status==='in_progress'?'<span class="badge">in corso</span>':(t.status==='complete_inferred'?'<span class="badge">fine ricostruita</span>':'');
    return '<article class="trip"><div><div class="when">'+esc(fmtTs(t.startTs))+'</div><div class="sub">'+status+'</div></div>'+
     '<div class="route"><div class="arrow">DA</div><div class="place">'+esc(t.from||'Posizione non disponibile')+'</div></div>'+
     '<div class="route"><div class="arrow">A</div><div class="place">'+esc(t.to||'Posizione non disponibile')+'</div></div>'+
@@ -2982,7 +2986,11 @@ function renderDashboard(d){
   var lockKnown = ['LOCKED','SECURED','UNLOCKED'].includes(lkV);
   var isLk = lkV === 'LOCKED' || lkV === 'SECURED';
   if($('statusBannerIcon')) $('statusBannerIcon').textContent = !lockKnown ? '❔' : (isLk ? '🔒' : '🔓');
-  if($('statusBannerLock')) { $('statusBannerLock').textContent = !lockKnown ? 'Stato serratura n.d.' : (isLk ? 'Bloccata' : 'Sbloccata'); $('statusBannerLock').style.color = !lockKnown ? '#f2b84b' : (isLk ? '#5cf29c' : '#ff5757'); }
+  if($('statusBannerLock')) {
+    var allClosed = [d.security.doorsClosed,d.security.windowsClosed,d.security.hoodClosed,d.security.tailgateClosed,d.security.sunroofClosed].every(function(v){return v===true;});
+    $('statusBannerLock').textContent = !lockKnown ? 'Stato vettura n.d.' : (isLk && allClosed ? 'Tutto chiuso' : (isLk ? 'Bloccata · verifica aperture' : 'Veicolo sbloccato'));
+    $('statusBannerLock').style.color = !lockKnown ? '#f2b84b' : (isLk && allClosed ? '#5cf29c' : '#ff5757');
+  }
   if($('statusBannerTime')) $('statusBannerTime').textContent = d.security.lockTimestamp ? formatTimestamp(d.security.lockTimestamp) : '';
   var oM='<b style="color:#5cf29c">✓</b> ', wM='<b style="color:#ff5757">✗</b> ', uM='<b style="color:#f2b84b">?</b> ';
   var mark=v=>v===null||v===undefined?uM:(v?oM:wM);
