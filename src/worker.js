@@ -3194,7 +3194,7 @@ function renderDashboard(d){
 function renderQuickStats(d){
   $('quickKm').textContent=d.quick.dailyKm===null?'—':\`\${fmt1(d.quick.dailyKm)} km\`;
   if(d.quick.dailyKm===null){
-    $('quickKmNote').textContent=d.quick.dailyKmUpdatedAt?'baseline diretta iniziata '+formatTimestamp(d.quick.dailyKmUpdatedAt)+' · dato odierno parziale':'dato odometro diretto non disponibile';
+    $('quickKmNote').textContent=d.quick.dailyKmUpdatedAt?'baseline odometro iniziata '+formatTimestamp(d.quick.dailyKmUpdatedAt)+' · dato odierno parziale':'dato odometro non disponibile';
   }else if(d.quick.dailyKmStale){
     $('quickKmNote').textContent=(d.quick.dailyKm>0?'almeno ':'')+fmt1(d.quick.dailyKm)+' km · odometro da aggiornare';
   }else if(d.quick.dailyKm===0){
@@ -3204,10 +3204,14 @@ function renderQuickStats(d){
     $('quickKmNote').textContent='distanza odierna'+src;
   }
   $('quickConsumption').textContent=(d.quick.consumptionKmL===null||!(d.quick.consumptionKmL>0))?'—':fmt1(d.quick.consumptionKmL)+' km/L';
+  var cq=d.consumptionQuality||{};
   if(d.quick.consumptionKmL!==null){
-    $('quickConsumptionNote').textContent=(d.quick.consumptionSource||'BMW')+(d.quick.consumptionSource==='stima storica'?' · affidabilità '+((d.consumptionQuality||{}).confidence||'n.d.'):'');
+    $('quickConsumptionNote').textContent=(d.quick.consumptionSource||'BMW')+
+      (d.quick.consumptionSource==='stima storica'
+        ? ' · '+(cq.samples||0)+' campioni · '+fmtInt(cq.coveredKm||0)+' km coperti'
+        : '');
   }else{
-    $('quickConsumptionNote').textContent='dato non abbastanza affidabile';
+    $('quickConsumptionNote').textContent=(cq.samples||0)+' campioni validi · '+fmtInt(cq.coveredKm||0)+' km coperti · servono almeno 4 campioni / 200 km';
   }
   $('quickEco').textContent=\`\${fmtInt(d.quick.ecoProPercent)}%\`;
   $('quickStatus').textContent=d.quick.vehicleState||'—';
