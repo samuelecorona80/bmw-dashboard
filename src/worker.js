@@ -581,6 +581,119 @@ async function detectRefuels(db, limit=20){
   }catch(_){return []}
 }
 
+function stationHistoryShard(stationId){
+  let h=0;
+  for(const ch of String(stationId)) h=(h*31+ch.charCodeAt(0))%64;
+  return String(h).padStart(2,'0');
+}
+
+async function enrichRefuelsWithStation(db, refuels){
+  if(!Array.isArray(refuels)||!refuels.length) return refuels||[];
+  try{
+    const gpsRows=await db.prepare(
+      `SELECT snapshot_timestamp, entity_id, state, attributes_json, bmw_timestamp
+       FROM bmw_raw_daily
+       WHERE entity_id IN (
+         'device_tracker.x3_m40d',
+         'vehicle.cabin.infotainment.navigation.currentLocation.latitude',
+         'vehicle.cabin.infotainment.navigation.currentLocation.longitude'
+       )
+       ORDER BY snapshot_timestamp ASC LIMIT 4000`
+    ).all();
+
+    const locs=[]; let lat=null,lng=null;
+    for(const r of gpsRows.results){
+      const ts=r.bmw_timestamp||r.snapshot_timestamp;
+      if(r.entity_id==='device_tracker.x3_m40d' && r.attributes_json){
+        try{
+          const a=JSON.parse(r.attributes_json);
+          if(Number.isFinite(Number(a.latitude))&&Number.isFinite(Number(a.longitude)))
+            locs.push({ts,lat:Number(a.latitude),lng:Number(a.longitude)});
+        }catch(_){}
+      }else if(r.entity_id.endsWith('.latitude')){
+        const v=Number(String(r.state).replace(',','.')); if(Number.isFinite(v))lat=v;
+        if(lat!==null&&lng!==null)locs.push({ts,lat,lng});
+      }else if(r.entity_id.endsWith('.longitude')){
+        const v=Number(String(r.state).replace(',','.')); if(Number.isFinite(v))lng=v;
+        if(lat!==null&&lng!==null)locs.push({ts,lat,lng});
+      }
+    }
+    const nearestLoc=ts=>{
+      const t=Date.parse(ts); let best=null,bestD=Infinity;
+      for(const p of locs){
+        const d=Math.abs(Date.parse(p.ts)-t);
+        if(d<bestD){best=p;bestD=d}
+      }
+      return bestD<=2*3600000?best:null;
+    };
+
+    const stationsRes=await fetch('https://carburanti.samuelecorona.it/data/stations.json',{cf:{cacheTtl:1800,cacheEverything:true}});
+    if(!stationsRes.ok) return refuels;
+    const stations=await stationsRes.json();
+
+    const shardCache=new Map();
+    const loadHistoricalPrice=async(stationId,dateKey)=>{
+      const shard=stationHistoryShard(stationId);
+      if(!shardCache.has(shard)){
+        try{
+          const r=await fetch('https://carburanti.samuelecorona.it/data/station_history/'+shard+'.json',{cf:{cacheTtl:1800,cacheEverything:true}});
+          shardCache.set(shard,r.ok?await r.json():null);
+        }catch(_){shardCache.set(shard,null)}
+      }
+      const payload=shardCache.get(shard);
+      const pts=payload?.stations?.[String(stationId)]?.G_s||[];
+      const exact=pts.find(p=>Array.isArray(p)&&p[0]===dateKey);
+      if(exact&&Number.isFinite(Number(exact[1]))) return {price:Number(exact[1])/1000,source:'storico stazione',date:exact[0]};
+      const before=pts.filter(p=>Array.isArray(p)&&p[0]<=dateKey&&Number.isFinite(Number(p[1]))).slice(-1)[0];
+      if(before) return {price:Number(before[1])/1000,source:'ultimo prezzo stazione disponibile',date:before[0]};
+      return null;
+    };
+
+    const out=[];
+    for(const r of refuels){
+      const loc=nearestLoc(r.timestamp);
+      if(!loc){out.push({...r,stationMatch:null});continue}
+      const candidates=[];
+      for(const s of stations){
+        if(!Number.isFinite(Number(s.lat))||!Number.isFinite(Number(s.lng))) continue;
+        const km=haversineKm(loc.lat,loc.lng,Number(s.lat),Number(s.lng));
+        if(km<=1) candidates.push({s,km});
+      }
+      candidates.sort((a,b)=>a.km-b.km);
+      const best=candidates[0]||null, second=candidates[1]||null;
+      // Strong match when the car is physically at/next to the station. If two
+      // stations are almost equally close, keep the match explicitly uncertain.
+      if(!best || best.km>0.45){out.push({...r,location:loc,stationMatch:null});continue}
+      const ambiguous=Boolean(second&&second.km<0.45&&Math.abs(second.km-best.km)<0.08);
+      const day=dateKeyInRome(r.timestamp);
+      const historical=await loadHistoricalPrice(best.s.id,day);
+      const currentPrice=Number(best.s?.prezzi?.Gasolio?.self);
+      const price=historical?.price||(Number.isFinite(currentPrice)?currentPrice:null);
+      const cost=price&&r.litresEstimated?Math.round(price*Number(r.litresEstimated)*100)/100:null;
+      out.push({
+        ...r,
+        location:loc,
+        stationMatch:{
+          id:best.s.id,
+          name:best.s.nome||best.s.bandiera||best.s.gestore||'Distributore',
+          brand:best.s.bandiera||null,
+          operator:best.s.gestore||null,
+          address:[best.s.indirizzo,best.s.comune,best.s.provincia].filter(Boolean).join(' · '),
+          distanceM:Math.round(best.km*1000),
+          confidence:ambiguous?'incerta':(best.km<=0.15?'alta':'probabile'),
+          ambiguous,
+          priceEur:price,
+          priceDate:historical?.date||null,
+          priceSource:historical?.source||(price?'prezzo corrente stazione':null),
+          costEur:cost
+        }
+      });
+    }
+    return out;
+  }catch(_){return refuels}
+}
+
+
 // ─────────────────────────────────────────────
 // GET /api/data — Dashboard payload
 // ─────────────────────────────────────────────
@@ -1826,7 +1939,7 @@ fetch('/api/trips').then(r=>r.json()).then(data=>{
 
 async function serveFuelData(env, cors) {
   const db = env.DB;
-  const refuels = await detectRefuels(db,50);
+  const refuels = await enrichRefuelsWithStation(db, await detectRefuels(db,50));
   const daily = await db.prepare(
     'SELECT snapshot_date, mileage_km, mileage_start_km, daily_distance_km, fuel_percent, fuel_litres, range_km, refuel_litres, refuel_cost_eur, diesel_price_eur FROM bmw_daily ORDER BY snapshot_date ASC'
   ).all();
@@ -2019,12 +2132,16 @@ function serveFuel() {
     // Refuel table
     var rt=document.getElementById('refuelTable');
     if(refuels.length>0){
-      var h='<table><thead><tr><th>Quando</th><th>Litri aggiunti</th><th>Livello</th><th>Odometro</th></tr></thead><tbody>';
+      var h='<table><thead><tr><th>Quando</th><th>Litri</th><th>Distributore</th><th>Prezzo</th><th>Costo</th><th>Odometro</th></tr></thead><tbody>';
       refuels.forEach(function(r){
         var d=r.timestamp?new Date(r.timestamp):new Date((r.date||'')+'T12:00:00');
         var ds=isNaN(d.getTime())?'—':d.toLocaleString('it-IT',{day:'2-digit',month:'short',year:'numeric',hour:'2-digit',minute:'2-digit'});
-        var level=(r.before!=null&&r.after!=null)?(Number(r.before).toFixed(1)+' → '+Number(r.after).toFixed(1)+' L'):(r.after!=null?Number(r.after).toFixed(1)+' L':'—');
-        h+='<tr class="refuel-row"><td><strong>'+ds+'</strong></td><td class="badge-green">+'+Number(r.added).toFixed(1)+' L</td><td>'+level+'</td><td>'+(r.km?Number(r.km).toLocaleString('it-IT')+' km':'—')+'</td></tr>';
+        var sm=r.stationMatch||null;
+        var station=sm?('<strong>'+sm.name+'</strong><div class="sub">'+(sm.address||'')+(sm.distanceM!=null?' · '+sm.distanceM+' m':'')+' · '+(sm.confidence||'')+'</div>'):'<span class="sub">Stazione non identificata</span>';
+        var price=sm&&sm.priceEur?Number(sm.priceEur).toLocaleString('it-IT',{minimumFractionDigits:3,maximumFractionDigits:3})+' €/L':'—';
+        var cost=sm&&sm.costEur?Number(sm.costEur).toLocaleString('it-IT',{style:'currency',currency:'EUR'}):'—';
+        var priceNote=sm&&sm.priceSource?'<div class="sub">'+sm.priceSource+(sm.priceDate?' · '+sm.priceDate:'')+'</div>':'';
+        h+='<tr class="refuel-row"><td><strong>'+ds+'</strong></td><td class="badge-green">+'+Number(r.added).toFixed(1)+' L</td><td>'+station+'</td><td>'+price+priceNote+'</td><td><strong>'+cost+'</strong></td><td>'+(r.km?Number(r.km).toLocaleString('it-IT')+' km':'—')+'</td></tr>';
       });
       h+='</tbody></table>';
       rt.innerHTML=h;
