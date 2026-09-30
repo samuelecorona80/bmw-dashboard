@@ -1623,6 +1623,7 @@ async function buildDetailedTrips(db, days=90){
   const seenEvent=new Set();
   const mileage=[];
   const locations=[];
+  const fuelSamples=[];
   let currentLat=null,currentLng=null;
 
   const pushLoc=(ts,lat,lng)=>{
@@ -1640,6 +1641,10 @@ async function buildDetailedTrips(db, days=90){
     if(r.entity_id==='sensor.x3_m40d_vehicle_mileage'||r.entity_id==='vehicle.vehicle.travelledDistance'){
       const km=Number(String(r.state).replace(',','.'));
       if(Number.isFinite(km)&&km>0)mileage.push({ts,km});
+    }
+    if(r.entity_id==='sensor.x3_m40d_range_tank_level_2'||r.entity_id==='vehicle.drivetrain.fuelSystem.remainingFuel'){
+      const litres=Number(String(r.state).replace(',','.'));
+      if(Number.isFinite(litres)&&litres>=0&&litres<=100) fuelSamples.push({ts,litres,entityId:r.entity_id});
     }
     if(r.entity_id==='device_tracker.x3_m40d' && r.attributes_json){
       try{
@@ -1670,6 +1675,7 @@ async function buildDetailedTrips(db, days=90){
 
   mileage.sort((a,b)=>Date.parse(a.ts)-Date.parse(b.ts));
   locations.sort((a,b)=>Date.parse(a.ts)-Date.parse(b.ts));
+  fuelSamples.sort((a,b)=>Date.parse(a.ts)-Date.parse(b.ts));
   events.sort((a,b)=>Date.parse(a.ts)-Date.parse(b.ts));
 
   const mileageAt=(ts,preferAfter=false)=>{
@@ -1692,6 +1698,15 @@ async function buildDetailedTrips(db, days=90){
     }
     return bestD<=3*3600000?best:null;
   };
+  const nearestFuel=ts=>{
+    const target=Date.parse(ts); if(!Number.isFinite(target)||!fuelSamples.length)return null;
+    let best=null,bestD=Infinity;
+    for(const p of fuelSamples){
+      const d=Math.abs(Date.parse(p.ts)-target);
+      if(d<bestD){best=p;bestD=d;}
+    }
+    return bestD<=45*60000?best:null;
+  };
 
   const trips=[];
   let pending=null;
@@ -1699,10 +1714,24 @@ async function buildDetailedTrips(db, days=90){
     const sm=mileageAt(startEv.ts,false), em=mileageAt(endTs,true);
     const dist=sm&&em&&em.km>=sm.km&&em.km-sm.km<500?Math.round((em.km-sm.km)*10)/10:null;
     const dur=Math.max(0,Math.round((Date.parse(endTs)-Date.parse(startEv.ts))/60000));
+    const sf=nearestFuel(startEv.ts), ef=nearestFuel(endTs);
+    let fuelUsedLitres=null, consumptionKmL=null, consumptionL100=null, consumptionQuality='insufficient';
+    if(sf&&ef&&dist!==null&&dist>=5){
+      const used=sf.litres-ef.litres;
+      const l100=used>0?(used/dist)*100:null;
+      if(used>0&&l100>=3&&l100<=25){
+        fuelUsedLitres=Math.round(used*100)/100;
+        consumptionL100=Math.round(l100*10)/10;
+        consumptionKmL=Math.round((dist/used)*10)/10;
+        consumptionQuality=dist>=15?'estimated':'low_sample';
+      }
+    }
     trips.push({
       startTs:startEv.ts,endTs,status,
       startKm:sm?sm.km:null,endKm:em?em.km:null,distanceKm:dist,durationMin:dur,
-      startLocation:nearestLoc(startEv.ts),endLocation:nearestLoc(endTs)
+      startLocation:nearestLoc(startEv.ts),endLocation:nearestLoc(endTs),
+      startFuelLitres:sf?sf.litres:null,endFuelLitres:ef?ef.litres:null,
+      fuelUsedLitres,consumptionKmL,consumptionL100,consumptionQuality
     });
   };
   for(const ev of events){
@@ -1722,7 +1751,9 @@ async function buildDetailedTrips(db, days=90){
     trips.push({
       startTs:pending.ts,endTs:null,status:'in_progress',
       startKm:sm?sm.km:null,endKm:em?em.km:null,distanceKm:dist,durationMin:Math.max(0,Math.round((Date.now()-Date.parse(pending.ts))/60000)),
-      startLocation:nearestLoc(pending.ts),endLocation:locations.length?locations[locations.length-1]:null
+      startLocation:nearestLoc(pending.ts),endLocation:locations.length?locations[locations.length-1]:null,
+      startFuelLitres:(nearestFuel(pending.ts)||{}).litres??null,endFuelLitres:fuelSamples.length?fuelSamples[fuelSamples.length-1].litres:null,
+      fuelUsedLitres:null,consumptionKmL:null,consumptionL100:null,consumptionQuality:'in_progress'
     });
   }
 
@@ -1765,7 +1796,7 @@ function serveTrips() {
 <title>BMW X3 M40d · Viaggi</title>
 <style>
 :root{--bg:#07111d;--card:#0c1b2d;--text:#f4f7fb;--muted:#9fb2c7;--blue:#3f8cff;--line:#274766;--green:#64e78b;--amber:#ffc65b}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.shell{max-width:1100px;margin:auto;padding:24px 18px}.top{display:flex;justify-content:space-between;align-items:center;margin-bottom:22px}.top a{color:var(--blue);text-decoration:none}.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:20px}.stat,.trip{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:15px}.stat small{display:block;color:var(--muted);font-size:11px;text-transform:uppercase}.stat strong{display:block;font-size:24px;margin-top:4px}.trips{display:grid;gap:10px}.trip{display:grid;grid-template-columns:145px 1fr 1fr 90px 90px;gap:12px;align-items:center}.when{font-weight:700}.sub{font-size:12px;color:var(--muted);margin-top:3px}.place{font-weight:700}.arrow{color:var(--muted);font-size:11px}.km{font-size:20px;font-weight:800}.badge{display:inline-block;font-size:11px;padding:3px 7px;border-radius:8px;background:rgba(255,198,91,.12);color:var(--amber)}.empty{padding:40px;text-align:center;color:var(--muted)}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.shell{max-width:1100px;margin:auto;padding:24px 18px}.top{display:flex;justify-content:space-between;align-items:center;margin-bottom:22px}.top a{color:var(--blue);text-decoration:none}.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:20px}.stat,.trip{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:15px}.stat small{display:block;color:var(--muted);font-size:11px;text-transform:uppercase}.stat strong{display:block;font-size:24px;margin-top:4px}.trips{display:grid;gap:10px}.trip{display:grid;grid-template-columns:145px 1fr 1fr 90px 105px 90px;gap:12px;align-items:center}.when{font-weight:700}.sub{font-size:12px;color:var(--muted);margin-top:3px}.place{font-weight:700}.arrow{color:var(--muted);font-size:11px}.km{font-size:20px;font-weight:800}.badge{display:inline-block;font-size:11px;padding:3px 7px;border-radius:8px;background:rgba(255,198,91,.12);color:var(--amber)}.empty{padding:40px;text-align:center;color:var(--muted)}
 @media(max-width:760px){.stats{grid-template-columns:1fr 1fr}.trip{grid-template-columns:1fr 1fr}.trip .route{grid-column:1/-1}.trip .km,.trip .duration{text-align:left}}
 </style></head><body><main class="shell"><div class="top"><a href="/">← Dashboard</a><h1>🗺️ Viaggi</h1></div>
 <div class="stats"><div class="stat"><small>Viaggi completi</small><strong id="count">—</strong></div><div class="stat"><small>Km registrati</small><strong id="total">—</strong></div><div class="stat"><small>Media per viaggio</small><strong id="avg">—</strong></div></div>
@@ -1784,6 +1815,7 @@ fetch('/api/trips').then(r=>r.json()).then(data=>{
     '<div class="route"><div class="arrow">DA</div><div class="place">'+esc(t.from||'Posizione non disponibile')+'</div></div>'+
     '<div class="route"><div class="arrow">A</div><div class="place">'+esc(t.to||'Posizione non disponibile')+'</div></div>'+
     '<div class="km">'+(t.distanceKm==null?'—':Number(t.distanceKm).toLocaleString('it-IT')+' km')+'</div>'+
+    '<div class="consumption"><div class="arrow">CONSUMO</div><strong>'+(t.consumptionKmL==null?'—':Number(t.consumptionKmL).toLocaleString('it-IT',{minimumFractionDigits:1,maximumFractionDigits:1})+' km/L')+'</strong><div class="sub">'+(t.fuelUsedLitres==null?'dati insufficienti':'~'+Number(t.fuelUsedLitres).toLocaleString('it-IT',{minimumFractionDigits:1,maximumFractionDigits:2})+' L')+'</div></div>'+
     '<div class="duration"><div class="arrow">DURATA</div><strong>'+dur(t.durationMin)+'</strong></div></article>'
  }).join('');
 }).catch(e=>{document.getElementById('list').innerHTML='<div class="empty">Errore: '+esc(e.message)+'</div>'});
@@ -2248,6 +2280,8 @@ function serveHistory() {
       return 'badge-val';
     }
     function formatState(state, entityId) {
+      var low=String(state||'').toLowerCase();
+      if(entityId==='binary_sensor.x3_m40d_trip_in_progress') return low==='on'?'In viaggio':'Fermo';
       var label = stateLabels[state] || state;
       if (!isNaN(parseFloat(state)) && entityId) {
         if (entityId.includes('pressure')) label = state + ' kPa';
@@ -2262,8 +2296,21 @@ function serveHistory() {
     }
     function entityName(id) {
       if (entityNames[id]) return entityNames[id];
-      var parts = id.split('.');
-      return parts.slice(-2).join('.');
+      var raw=String(id||'').split('.').pop()
+        .replace(/^x3_m40d_/,'')
+        .replace(/^wbatx[0-9a-z]+_/i,'')
+        .replace(/_/g,' ')
+        .replace(/\bfront\b/gi,'anteriore')
+        .replace(/\brear\b/gi,'posteriore')
+        .replace(/\bdriver\b/gi,'sinistra')
+        .replace(/\bpassenger\b/gi,'destra')
+        .replace(/\bdoor state\b/gi,'porta')
+        .replace(/\bwindow state\b/gi,'finestrino')
+        .replace(/\btailgate\b/gi,'portellone')
+        .replace(/\bhood\b/gi,'cofano')
+        .replace(/\btyre\b/gi,'pneumatico')
+        .replace(/\btire\b/gi,'pneumatico');
+      return raw.charAt(0).toUpperCase()+raw.slice(1);
     }
     
     function load() {
