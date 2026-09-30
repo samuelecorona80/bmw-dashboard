@@ -2999,7 +2999,7 @@ function renderDashboard(d){
   var freshnessDot=$('freshness').querySelector('i');
   if(freshnessDot) freshnessDot.style.background=odFresh.status==='fresh'?'var(--green)':(odFresh.status==='stale'?'var(--amber)':'var(--red)');
   $('freshness').innerHTML='<i></i>'+escapeHtml('Odometro · '+ageLabel(mileageTs).replace('Dato BMW appena aggiornato','appena aggiornato').replace('Dato BMW: ',''));
-  $('homePill').textContent=\`● \${locationLabel(d.core.locationState)}\`;
+  if($('homePill')) $('homePill').textContent=\`● \${locationLabel(d.core.locationState)}\`;
   // Status banner rendering
   var lkV = (d.security.lockState || '').toUpperCase();
   var lockKnown = ['LOCKED','SECURED','UNLOCKED'].includes(lkV);
