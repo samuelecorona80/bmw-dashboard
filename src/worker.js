@@ -2106,16 +2106,42 @@ async function serveHistoryData(env, cors, request) {
     
     const rows = await db.prepare(sql).all();
     
-    // Smart dedup: skip consecutive identical states per entity
+    // Smart dedup: show only meaningful changes. Multiple HA/BMW entities can
+    // describe the same physical item (for example two tailgate sensors), so
+    // deduplicate by semantic component + state rather than raw entity_id.
+    const semanticKey = id => {
+        const s=String(id||'').toLowerCase();
+        if(s.includes('tailgate') || s.includes('trunk')) return 'portellone';
+        if(s.includes('hood')) return 'cofano';
+        if(s.includes('door_state_front_driver') || (s.includes('door.row1.driver'))) return 'porta_ant_sx';
+        if(s.includes('door_state_front_passenger') || (s.includes('door.row1.passenger'))) return 'porta_ant_dx';
+        if(s.includes('door_state_rear_driver') || (s.includes('door.row2.driver'))) return 'porta_post_sx';
+        if(s.includes('door_state_rear_passenger') || (s.includes('door.row2.passenger'))) return 'porta_post_dx';
+        if(s.includes('window_state_front_driver') || (s.includes('window.row1.driver'))) return 'finestrino_ant_sx';
+        if(s.includes('window_state_front_passenger') || (s.includes('window.row1.passenger'))) return 'finestrino_ant_dx';
+        if(s.includes('window_state_rear_driver') || (s.includes('window.row2.driver'))) return 'finestrino_post_sx';
+        if(s.includes('window_state_rear_passenger') || (s.includes('window.row2.passenger'))) return 'finestrino_post_dx';
+        if(s.includes('sunroof')) return 'tetto';
+        if(s.includes('trip_in_progress')) return 'viaggio';
+        if(s==='device_tracker.x3_m40d') return 'posizione';
+        return id;
+    };
+    const normalizeHistoryState = (id,state) => {
+        let v=String(state??'').trim().toLowerCase();
+        if(id.includes('latitude') || id.includes('longitude')) {
+            const n=parseFloat(v); return Number.isFinite(n)?n.toFixed(4):v;
+        }
+        if(v==='closed'||v==='off'||v==='false') return 'closed';
+        if(v==='open'||v==='on'||v==='true') return 'open';
+        if(v==='locked'||v==='secured') return 'locked';
+        if(v==='unlocked') return 'unlocked';
+        return v;
+    };
     const deduped = [];
     const lastState = {};
     for (const row of rows.results) {
-        const key = row.entity_id;
-        let stateVal = row.state;
-        // GPS: round to 4 decimals before comparing
-        if (key.includes('latitude') || key.includes('longitude')) {
-            stateVal = parseFloat(stateVal).toFixed(4);
-        }
+        const key = semanticKey(row.entity_id);
+        const stateVal = normalizeHistoryState(row.entity_id,row.state);
         if (lastState[key] === stateVal) continue;
         lastState[key] = stateVal;
         deduped.push(row);
@@ -2274,7 +2300,7 @@ function serveHistory() {
     
     var stateLabels = {
       'UNLOCKED': 'Sbloccata', 'LOCKED': 'Bloccata', 'SECURED': 'Protetta',
-      'CLOSED': 'Chiuso', 'OPEN': 'Aperto',
+      'CLOSED': 'Chiuso', 'OPEN': 'Aperto', 'closed': 'Chiuso', 'open': 'Aperto',
       'true': 'Aperto', 'false': 'Chiuso',
       'on': 'Aperto', 'off': 'Chiuso',
       'INACTIVE': 'Inattivo', 'ACTIVE': 'Attivo',
