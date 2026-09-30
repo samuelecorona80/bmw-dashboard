@@ -1746,7 +1746,7 @@ async function buildDetailedTrips(db, days=90){
 
 async function serveTripsData(env, cors) {
   const trips=await buildDetailedTrips(env.DB,90);
-  const complete=trips.filter(t=>t.status==='complete');
+  const complete=trips.filter(t=>t.status==='complete'||t.status==='complete_inferred');
   const totalKm=Math.round(complete.reduce((s,t)=>s+(Number(t.distanceKm)||0),0)*10)/10;
   return jsonResponse({
     trips,
@@ -1920,6 +1920,24 @@ function serveFuel() {
       details.push(detail);
       prevFuel=fuel;
     });
+
+    // Prefer refuels reconstructed from raw BMW events: they include the
+    // actual detection timestamp and a more precise litre delta than daily snapshots.
+    if(Array.isArray(data.refuels) && data.refuels.length){
+      refuels=data.refuels.map(function(r){
+        var d=new Date(r.timestamp);
+        return {
+          date:isNaN(d.getTime())?null:d.toISOString().substring(0,10),
+          timestamp:r.timestamp,
+          added:Number(r.litresEstimated)||0,
+          after:r.afterLitres,
+          before:r.beforeLitres,
+          pctAfter:null,
+          km:r.odometerKm,
+          source:r.source||'BMW'
+        };
+      });
+    }
 
     var fuelDays=cPoints.length;
     if(fuelDays<3){
@@ -3247,7 +3265,7 @@ function renderTyres(t){
   });
   const targetAny=Boolean(t.alerts&&t.alerts.any),trendAny=Boolean(t.trendAlerts&&t.trendAlerts.any);
   $('tyreAlertSummary').classList.toggle('hidden',!(targetAny||trendAny));
-  $('tyreAlertSummary').textContent=targetAny?'⚠ Pressione fuori target di oltre 0,5 bar':trendAny?'⚠ Calo di almeno 0,3 bar rispetto alla precedente rilevazione':'';
+  $('tyreAlertSummary').textContent=targetAny?'⚠ Pressione fuori target di oltre 0,5 bar':trendAny?'⚠ Calo di almeno 0,4 bar rispetto alla precedente rilevazione':'';
 }
 
 function buildBaseCharts(history,tyres){
