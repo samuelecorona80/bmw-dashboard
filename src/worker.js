@@ -2220,6 +2220,18 @@ function serveHistory() {
       'vehicle.cabin.door.row1.passenger.isOpen': '\ud83d\udeb9 Porta passeggero',
       'vehicle.cabin.door.row2.driver.isOpen': '\ud83d\udeb9 Porta post. SX',
       'vehicle.cabin.door.row2.passenger.isOpen': '\ud83d\udeb9 Porta post. DX',
+      'device_tracker.x3_m40d': 'Posizione veicolo',
+      'binary_sensor.x3_m40d_trip_in_progress': 'Viaggio in corso',
+      'binary_sensor.x3_m40d_door_state_front_driver': 'Porta anteriore sinistra',
+      'binary_sensor.x3_m40d_door_state_front_passenger': 'Porta anteriore destra',
+      'binary_sensor.x3_m40d_door_state_rear_driver': 'Porta posteriore sinistra',
+      'binary_sensor.x3_m40d_door_state_rear_passenger': 'Porta posteriore destra',
+      'sensor.x3_m40d_doors_overall_state': 'Stato chiusura vettura',
+      'sensor.x3_m40d_window_state_front_driver': 'Finestrino anteriore sinistro',
+      'sensor.x3_m40d_window_state_front_passenger': 'Finestrino anteriore destro',
+      'sensor.x3_m40d_window_state_rear_driver': 'Finestrino posteriore sinistro',
+      'sensor.x3_m40d_window_state_rear_passenger': 'Finestrino posteriore destro',
+      'sensor.x3_m40d_sunroof_overall_state': 'Tetto apribile',
       'binary_sensor.x3_m40d_tailgate_door_state': '\ud83d\udeb9 Portellone',
       'binary_sensor.x3_m40d_tailgate_state': '\ud83d\udeb9 Portellone',
       'binary_sensor.x3_m40d_hood_state': '\ud83d\ude97 Cofano',
@@ -2282,6 +2294,7 @@ function serveHistory() {
     function formatState(state, entityId) {
       var low=String(state||'').toLowerCase();
       if(entityId==='binary_sensor.x3_m40d_trip_in_progress') return low==='on'?'In viaggio':'Fermo';
+      if(entityId==='device_tracker.x3_m40d') return low==='home'?'Casa':((low==='not_home'||low==='away')?'Fuori casa':state);
       var label = stateLabels[state] || state;
       if (!isNaN(parseFloat(state)) && entityId) {
         if (entityId.includes('pressure')) label = state + ' kPa';
@@ -2370,10 +2383,10 @@ function serveHistory() {
       }
       
       function tyrePos(id) {
-        if (id.includes('front_left') || id.includes('row1') && id.includes('left')) return 'FL';
-        if (id.includes('front_right') || id.includes('row1') && id.includes('right')) return 'FR';
-        if (id.includes('rear_left') || id.includes('row2') && id.includes('left')) return 'RL';
-        if (id.includes('rear_right') || id.includes('row2') && id.includes('right')) return 'RR';
+        if (id.includes('front_left') || id.includes('row1') && id.includes('left')) return 'Ant. SX';
+        if (id.includes('front_right') || id.includes('row1') && id.includes('right')) return 'Ant. DX';
+        if (id.includes('rear_left') || id.includes('row2') && id.includes('left')) return 'Post. SX';
+        if (id.includes('rear_right') || id.includes('row2') && id.includes('right')) return 'Post. DX';
         return '?';
       }
       
@@ -2400,14 +2413,14 @@ function serveHistory() {
           var parts = tyreItems.map(function(t) {
             var pos = tyrePos(t.entity_id);
             var val = parseInt(t.state);
-            var target = (pos === 'FL' || pos === 'FR') ? targetF : targetR;
+            var target = (pos === 'Ant. SX' || pos === 'Ant. DX') ? targetF : targetR;
             return '<span style="margin-right:12px">' + pos + ' <strong>' + t.state + '</strong>' + pressureBar(t.state, target) + '</span>';
           });
           html += '<div class="ev"><span class="ev-time">' + time + '</span><span class="ev-entity">\ud83d\udd27 Pressione</span><span>' + parts.join('') + '<small style="color:var(--muted)">kPa</small></span></div>';
         } else if (tyreItems.length === 1) {
           var t = tyreItems[0];
           var pos = tyrePos(t.entity_id);
-          var target = (pos === 'FL' || pos === 'FR') ? targetF : targetR;
+          var target = (pos === 'Ant. SX' || pos === 'Ant. DX') ? targetF : targetR;
           html += '<div class="ev"><span class="ev-time">' + time + '</span><span class="ev-entity">\ud83d\udd27 Pressione ' + pos + '</span><span><strong>' + t.state + '</strong>' + pressureBar(t.state, target) + ' <small style="color:var(--muted)">kPa</small></span></div>';
         }
         
