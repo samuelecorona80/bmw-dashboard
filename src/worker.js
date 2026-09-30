@@ -634,12 +634,14 @@ async function handleGetData(env, cors) {
     }
   }
   let lastMovement = null;
-  const directProgress = progress.filter(e => e.source === 'BMW CarData · Cloudflare');
-  if (directProgress.length >= 2) {
-    const last = directProgress[directProgress.length - 1];
-    const prev = directProgress[directProgress.length - 2];
+  if (progress.length >= 2) {
+    const last = progress[progress.length - 1];
+    const prev = progress[progress.length - 2];
     const moved = last.km - prev.km;
-    if (moved > 0 && moved < 1000) lastMovement = { distanceKm: Math.round(moved * 10) / 10, timestamp: last.timestamp, source: 'BMW CarData · Cloudflare', odometerKm: last.km };
+    if (moved > 0 && moved < 1000) {
+      const source = last.source === 'BMW CarData · Cloudflare' ? 'BMW CarData · Cloudflare' : 'BMW CarData · Home Assistant';
+      lastMovement = { distanceKm: Math.round(moved * 10) / 10, timestamp: last.timestamp, source, odometerKm: last.km };
+    }
   }
 
   // "Km oggi": Home Assistant/BavarianData is now the primary ingestion path.
@@ -765,7 +767,8 @@ async function handleGetData(env, cors) {
   const normal = Math.max(0, round_(100-ecoPro-ecoProPlus-electric, 1));
   const tripRaw = state('binary_sensor.x3_m40d_trip_in_progress');
   const tripInProgress = validState(tripRaw) ? String(tripRaw).toLowerCase()!=='off' : null;
-  const trip = { ecoPro, ecoProPlus, electric, normal, inProgress: tripInProgress, totalReported: round_(ecoPro+ecoProPlus+electric,1) };
+  const tripTimestamp = ts('sensor.x3_m40d_trip_eco_pro_mode_share') || ts('sensor.x3_m40d_trip_eco_pro_plus_share') || ts('sensor.x3_m40d_trip_electric_share');
+  const trip = { ecoPro, ecoProPlus, electric, normal, inProgress: tripInProgress, totalReported: round_(ecoPro+ecoProPlus+electric,1), bmwTimestamp: tripTimestamp };
 
   // Analytics from history
   const analytics = computeDailyAnalytics(history);
@@ -2674,9 +2677,9 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     <section class="quick-stats" aria-label="Riepilogo rapido">
       <article class="quick-card"><span class="quick-icon">🛣️</span><div><small>Km oggi</small><strong id="quickKm">—</strong><em id="quickKmNote">ultimo intervallo giornaliero</em></div></article>
       <article class="quick-card"><span class="quick-icon">⛽</span><div><small>Consumo stimato</small><strong id="quickConsumption">—</strong><em id="quickConsumptionNote">km/L stimati</em></div></article>
-      <article class="quick-card"><span class="quick-icon">🌿</span><div><small>ECO Pro</small><strong id="quickEco">—</strong><em>ultimo trip BMW</em></div></article>
+      <article class="quick-card"><span class="quick-icon">🌿</span><div><small>ECO Pro</small><strong id="quickEco">—</strong><em id="quickEcoNote">ultimo trip BMW</em></div></article>
       <article class="quick-card"><span class="quick-icon">💰</span><div><small>Costo/km</small><strong id="quickCostKm">—</strong><em id="quickCostNote">€ al km stimato</em></div></article>
-      <article class="quick-card"><span class="quick-icon">🅿️</span><div><small>Stato</small><strong id="quickStatus">—</strong><em id="quickStatusNote">stato corrente</em></div></article>
+      <article class="quick-card"><span class="quick-icon">🅿️</span><div><small>Ultima posizione</small><strong id="quickStatus">—</strong><em id="quickStatusNote">ultima posizione BMW</em></div></article>
     </section>
 
     <section class="insight-grid">
@@ -2734,7 +2737,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 
     <section class="analytics-grid" id="drivingSection">
       <article class="card compact-card"><div class="card-kicker">Distanza</div><div class="big-metric"><span id="distanceKm">—</span><small> km</small></div><div class="metric-row-compact"><div><span class="metric-label">km/giorno</span><strong id="avgKmDay">—</strong></div><div><span class="metric-label" id="activeLabel">km/giorno attivo</span><strong id="avgKmActive">—</strong></div></div><div class="metric-row-compact"><div><span class="metric-label">Giorni guidati</span><strong id="drivingDaysVal">—</strong></div><div><span class="metric-label">Più lungo</span><strong id="longestDayVal">—</strong></div></div><div class="partial-badge hidden" id="drivingDaysCov">Copertura parziale</div></article>
-      <article class="card compact-card"><div class="card-kicker">Consumo carburante</div><div class="big-metric"><span id="fuelKmL">—</span><small> km/l</small> <span class="badge hidden" id="fuelBadge"></span></div><div class="mini-note hidden" id="fuelCoverage"></div></article>
+      <article class="card compact-card"><div class="card-kicker">Consumo carburante</div><div class="big-metric"><span id="fuelKmL">—</span><small> km/L</small> <span class="badge hidden" id="fuelBadge"></span></div><div class="mini-note hidden" id="fuelCoverage"></div></article>
       <article class="card chart-card"><div class="card-kicker">Distanza giornaliera</div><div class="chart-holder"><canvas id="dailyKmChart2"></canvas><div class="empty-state hidden" id="dailyKmEmpty2">In attesa di dati</div></div></article>
       <article class="card compact-card"><div class="card-kicker">Viaggi</div><div id="tripStatsContent"><div class="trip-collecting"><span class="pulse-dot"></span> Raccolta dati viaggi in corso</div></div></article>
       <article class="card compact-card coverage-card"><div class="card-kicker">Copertura chilometraggio</div><div class="coverage-line"><span id="covFirst">—</span> → <span id="covLast">—</span> km</div><div class="coverage-dist"><span id="covDist">—</span> km monitorati</div><div class="mini-note hidden" id="covGap"></div></article>
@@ -2974,7 +2977,8 @@ function renderDashboard(d){
   $('lastBmw').textContent=dateTime(mileageTs);
   var pipeFresh=(d.freshness&&d.freshness.pipeline)||{status:'unknown',timestamp:null};
   if($('lastHaSync')){
-    $('lastHaSync').textContent=pipeFresh.timestamp?formatTimestamp(pipeFresh.timestamp)+' · '+ageLabel(pipeFresh.timestamp):'non disponibile';
+    var syncAge=pipeFresh.timestamp?ageLabel(pipeFresh.timestamp).replace('Dato BMW: ','').replace('Dato BMW appena aggiornato','adesso'):'';
+    $('lastHaSync').textContent=pipeFresh.timestamp?formatTimestamp(pipeFresh.timestamp)+' · sync '+syncAge:'non disponibile';
     $('lastHaSync').style.color=pipeFresh.status==='fresh'?'var(--green)':(pipeFresh.status==='stale'?'var(--amber)':'var(--red)');
   }
   var odFresh=(d.freshness&&d.freshness.odometer)||{status:'unknown'};
@@ -3097,7 +3101,9 @@ function renderDashboard(d){
   if($('lastRefuel')){
     if(d.refuels&&d.refuels.last){
       $('lastRefuel').textContent='~'+fmt1(d.refuels.last.litresEstimated)+' L';
-      $('lastRefuelNote').textContent=formatTimestamp(d.refuels.last.timestamp)+(d.refuels.last.odometerKm?' · '+fmtInt(d.refuels.last.odometerKm)+' km':'')+' · stima';
+      var rd=new Date(d.refuels.last.timestamp);
+      var rdate=Number.isNaN(rd.getTime())?'data n.d.':rd.toLocaleDateString('it-IT',{day:'2-digit',month:'short',year:'numeric'});
+      $('lastRefuelNote').textContent=rdate+(d.refuels.last.odometerKm?' · '+fmtInt(d.refuels.last.odometerKm)+' km':'')+' · stima da variazione livello';
     }else{
       $('lastRefuel').textContent='—';
       $('lastRefuelNote').textContent='Nessun rifornimento ≥8 L rilevato nei dati disponibili';
@@ -3214,7 +3220,7 @@ function renderQuickStats(d){
   } else {
     $('heroCostMonth').textContent='';
   }
-  $('quickStatusNote').textContent=d.trip.inProgress?'trip BMW in corso':(d.location&&d.location.label?'posizione BMW CarData':'ultima posizione disponibile');
+  $('quickStatusNote').textContent=d.trip.inProgress?'trip BMW in corso':(d.location&&d.location.timestamp?'ultima posizione BMW · '+ageLabel(d.location.timestamp).replace('Dato BMW: ','').replace('Dato BMW appena aggiornato','adesso'):'ultima posizione disponibile');
 }
 
 function renderAnalytics(a){
@@ -3398,7 +3404,7 @@ function renderFuelCard(f) {
     fuelVal.textContent = '—';
     fuelBadge.textContent = 'Dati insufficienti';
     fuelBadge.className = 'badge insufficient';
-    fuelCov.textContent = fmtInt(f.fuelCoveredKm) + ' km / ' + fmt1(f.fuelConsumedL) + ' L osservati';
+    fuelCov.textContent = 'Copertura utile: ' + fmtInt(f.fuelCoveredKm) + ' km · campioni non sufficienti' + (f.refuelCount ? ' · ' + f.refuelCount + ' riforniment' + (f.refuelCount===1?'o':'i') + ' rilevat' + (f.refuelCount===1?'o':'i') : '');
     fuelCov.classList.remove('hidden');
   } else if (f.consumptionConfidence === 'provisional') {
     fuelVal.textContent = fmt1(f.kmPerLitre);
@@ -3421,17 +3427,17 @@ function renderTripStats(t) {
     return;
   }
   if (t.tripCount === 0) {
-    el.innerHTML = '<div class="mini-note">No completed trips in this period</div>';
+    el.innerHTML = '<div class="mini-note">Nessun viaggio completo nel periodo</div>';
     return;
   }
   const avgDist = t.trips.reduce((s, tr) => s + (tr.distanceKm || 0), 0) / t.tripCount;
   const avgDur = t.trips.reduce((s, tr) => s + (tr.durationMin || 0), 0) / t.tripCount;
   const longest = t.trips.reduce((mx, tr) => (tr.distanceKm || 0) > (mx.distanceKm || 0) ? tr : mx, t.trips[0]);
   el.innerHTML = '<div class="trip-grid">' +
-    '<div class="trip-stat"><span class="trip-num">' + t.tripCount + '</span><span class="trip-label">trips</span></div>' +
-    '<div class="trip-stat"><span class="trip-num">' + fmtInt(avgDist) + '</span><span class="trip-label">avg km</span></div>' +
-    '<div class="trip-stat"><span class="trip-num">' + fmtInt(avgDur) + '</span><span class="trip-label">avg min</span></div>' +
-    '<div class="trip-stat"><span class="trip-num">' + fmtInt(longest.distanceKm) + '</span><span class="trip-label">longest km</span></div>' +
+    '<div class="trip-stat"><span class="trip-num">' + t.tripCount + '</span><span class="trip-label">viaggi</span></div>' +
+    '<div class="trip-stat"><span class="trip-num">' + fmtInt(avgDist) + '</span><span class="trip-label">km medi</span></div>' +
+    '<div class="trip-stat"><span class="trip-num">' + fmtInt(avgDur) + '</span><span class="trip-label">min medi</span></div>' +
+    '<div class="trip-stat"><span class="trip-num">' + fmtInt(longest.distanceKm) + '</span><span class="trip-label">più lungo km</span></div>' +
     '</div>';
 }
 
