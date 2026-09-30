@@ -642,23 +642,23 @@ async function handleGetData(env, cors) {
     if (moved > 0 && moved < 1000) lastMovement = { distanceKm: Math.round(moved * 10) / 10, timestamp: last.timestamp, source: 'BMW CarData · Cloudflare', odometerKm: last.km };
   }
 
-  // "Km oggi" must only use samples collected by the new direct Cloudflare path.
-  // Legacy HA/history can remain in D1 for history, but it must not contaminate today's live tile.
-  const todayProgress = progress.filter(e => e.date === todayRome && e.source === 'BMW CarData · Cloudflare');
-  if (todayProgress.length >= 2) {
-    let total = 0;
-    for (let i = 1; i < todayProgress.length; i++) {
-      const d = todayProgress[i].km - todayProgress[i-1].km;
-      if (d > 0 && d < 500) total += d;
+  // "Km oggi": Home Assistant/BavarianData is now the primary ingestion path.
+  // Use the latest monotonic BMW odometer value from today minus the best
+  // odometer baseline observed before today. This also works when only one
+  // fresh odometer sample is received today (for example after MQTT reconnect).
+  const todayMileageInfo = maxMileageInfo(mileageEvents.filter(e => e.date === todayRome));
+  const todayMileageEvent = todayMileageInfo ? todayMileageInfo.lastSeen : null;
+  if (todayMileageInfo && beforeTodayInfo) {
+    const d = todayMileageInfo.km - beforeTodayInfo.km;
+    if (d >= 0 && d < 500) {
+      resolvedDailyKm = Math.round(d * 10) / 10;
+      resolvedDailyKmSource = 'BMW CarData · Home Assistant';
+      resolvedDailyKmTimestamp = todayMileageEvent ? todayMileageEvent.timestamp : null;
     }
-    resolvedDailyKm = Math.round(total * 10) / 10;
-    const latestToday = todayProgress[todayProgress.length - 1];
-    resolvedDailyKmSource = 'BMW CarData · Cloudflare';
-    resolvedDailyKmTimestamp = latestToday.timestamp;
-  } else if (todayProgress.length === 1) {
+  } else if (todayMileageInfo) {
     resolvedDailyKm = null;
-    resolvedDailyKmSource = 'BMW CarData · Cloudflare';
-    resolvedDailyKmTimestamp = todayProgress[0].timestamp;
+    resolvedDailyKmSource = 'BMW CarData · Home Assistant';
+    resolvedDailyKmTimestamp = todayMileageEvent ? todayMileageEvent.timestamp : null;
   }
 
   let milestone81000 = null;
