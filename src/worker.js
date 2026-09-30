@@ -2148,7 +2148,25 @@ async function serveHistoryData(env, cors, request) {
         if (deduped.length >= limit) break;
     }
     
-    return new Response(JSON.stringify({ events: deduped, count: deduped.length, total_raw: rows.results.length }), {
+    const openingRows = await db.prepare(
+      "SELECT snapshot_timestamp, entity_id, state, bmw_timestamp FROM bmw_raw_daily WHERE " +
+      "(entity_id LIKE '%door_state_%' OR entity_id LIKE '%door.row%' OR entity_id LIKE '%window_state_%' OR entity_id LIKE '%window.row%' OR entity_id LIKE '%tailgate%' OR entity_id LIKE '%trunk%' OR entity_id LIKE '%hood%' OR entity_id LIKE '%sunroof%') " +
+      "ORDER BY snapshot_timestamp DESC LIMIT 2000"
+    ).all();
+    const openingMap = {};
+    for (const row of openingRows.results) {
+      const key=semanticKey(row.entity_id);
+      if(!['porta_ant_sx','porta_ant_dx','porta_post_sx','porta_post_dx','finestrino_ant_sx','finestrino_ant_dx','finestrino_post_sx','finestrino_post_dx','portellone','cofano','tetto'].includes(key)) continue;
+      const st=normalizeHistoryState(row.entity_id,row.state);
+      const ts=row.bmw_timestamp||row.snapshot_timestamp;
+      const x=openingMap[key]||(openingMap[key]={key,current:null,currentAt:null,lastOpen:null,lastClosed:null});
+      if(x.current===null){x.current=st;x.currentAt=ts;}
+      if(st==='open'&&!x.lastOpen)x.lastOpen=ts;
+      if(st==='closed'&&!x.lastClosed)x.lastClosed=ts;
+    }
+    const openingSummary=Object.values(openingMap);
+
+    return new Response(JSON.stringify({ events: deduped, count: deduped.length, total_raw: rows.results.length, openingSummary }), {
         headers: { ...cors, 'Content-Type': 'application/json' }
     });
 }
@@ -2177,6 +2195,7 @@ function serveHistory() {
     .cat-pill:hover{border-color:var(--accent)}
     .cat-pill.active{background:rgba(67,142,255,.2);color:var(--accent);border-color:var(--accent)}
     .stats-bar{display:flex;gap:16px;margin-bottom:16px;font-size:12px;color:var(--muted)}
+    .state-title{font-size:13px;font-weight:800;margin:18px 0 10px}.state-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px;margin-bottom:18px}.state-card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:13px}.state-head{display:flex;justify-content:space-between;gap:8px;align-items:center}.state-name{font-weight:700;font-size:13px}.state-now{font-size:11px;font-weight:800;padding:4px 8px;border-radius:999px}.state-now.closed{background:rgba(46,165,92,.16);color:#5cf29c}.state-now.open{background:rgba(255,87,87,.16);color:#ff7575}.state-now.unknown{background:rgba(123,147,168,.15);color:var(--muted)}.state-times{margin-top:9px;display:grid;gap:4px;font-size:11px;color:var(--muted)}.state-times b{color:var(--text);font-weight:600}
     .event-list{border:1px solid var(--line);border-radius:12px;overflow:hidden}
     .date-sep{padding:10px 16px;background:rgba(67,142,255,.06);font-size:11px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;border-bottom:1px solid var(--line)}
     .ev{display:grid;grid-template-columns:90px 1fr auto;gap:8px;padding:10px 16px;border-bottom:1px solid rgba(39,71,102,.25);align-items:center;font-size:13px;transition:background .15s}
@@ -2217,6 +2236,8 @@ function serveHistory() {
       <button class="cat-pill" data-cat="tyres" onclick="setCat('tyres')">\ud83d\udd27 Pneumatici</button>
       <button class="cat-pill" data-cat="climate" onclick="setCat('climate')">\u2744\ufe0f Clima</button>
     </div>
+    <div class="state-title">Stato aperture</div>
+    <div id="stateGrid" class="state-grid"><div class="loading">Caricamento stato…</div></div>
     <div class="stats-bar">
       <span id="statsCount">Caricamento...</span>
       <span id="statsDedup"></span>
@@ -2366,6 +2387,14 @@ function serveHistory() {
       var events = data.events || [];
       document.getElementById('statsCount').textContent = events.length + ' cambi di stato';
       document.getElementById('statsDedup').textContent = data.total_raw ? '(filtrati da ' + data.total_raw + ' eventi)' : '';
+      var stateNames={porta_ant_sx:'Porta ant. sinistra',porta_ant_dx:'Porta ant. destra',porta_post_sx:'Porta post. sinistra',porta_post_dx:'Porta post. destra',finestrino_ant_sx:'Finestrino ant. sinistro',finestrino_ant_dx:'Finestrino ant. destro',finestrino_post_sx:'Finestrino post. sinistro',finestrino_post_dx:'Finestrino post. destro',portellone:'Portellone',cofano:'Cofano',tetto:'Tetto apribile'};
+      function shortDt(ts){if(!ts)return 'mai rilevato';var d=new Date(ts);return d.toLocaleString('it-IT',{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'})}
+      var ss=data.openingSummary||[];
+      document.getElementById('stateGrid').innerHTML=ss.length?ss.map(function(x){
+        var cls=x.current==='closed'?'closed':(x.current==='open'?'open':'unknown');
+        var label=x.current==='closed'?'Chiuso':(x.current==='open'?'APERTO':'N.d.');
+        return '<div class="state-card"><div class="state-head"><span class="state-name">'+(stateNames[x.key]||x.key)+'</span><span class="state-now '+cls+'">'+label+'</span></div><div class="state-times"><span>Ultima apertura: <b>'+shortDt(x.lastOpen)+'</b></span><span>Ultima chiusura: <b>'+shortDt(x.lastClosed)+'</b></span><span>Stato rilevato: <b>'+shortDt(x.currentAt)+'</b></span></div></div>';
+      }).join(''):'<div class="loading">Nessuno stato aperture disponibile</div>';
       
       if (!events.length) {
         document.getElementById('eventList').innerHTML = '<div class="loading">Nessun evento per questa categoria</div>';
