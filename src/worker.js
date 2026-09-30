@@ -2098,9 +2098,9 @@ async function serveHistoryData(env, cors, request) {
         'climate': "entity_id LIKE '%preconditioning%' OR entity_id LIKE '%precond%'"
     };
     
-    let sql = 'SELECT snapshot_timestamp, entity_id, state, bmw_timestamp, trigger_reason FROM bmw_raw_daily';
+    let sql = "SELECT snapshot_timestamp, entity_id, state, bmw_timestamp, trigger_reason FROM bmw_raw_daily WHERE entity_id NOT LIKE '%battery_ev_target_state_of_charge%'";
     if (category !== 'all' && categoryFilters[category]) {
-        sql += ' WHERE (' + categoryFilters[category] + ')';
+        sql += ' AND (' + categoryFilters[category] + ')';
     }
     sql += ' ORDER BY snapshot_timestamp DESC LIMIT ' + Math.min(limit * 3, 1500);
     
@@ -2258,6 +2258,8 @@ function serveHistory() {
       'sensor.x3_m40d_window_state_rear_driver': 'Finestrino posteriore sinistro',
       'sensor.x3_m40d_window_state_rear_passenger': 'Finestrino posteriore destro',
       'sensor.x3_m40d_sunroof_overall_state': 'Tetto apribile',
+      'sensor.x3_m40d_sunroof_tilt_state': 'Tetto apribile · inclinazione',
+      'sensor.x3_m40d_sunroof_state': 'Tetto apribile',
       'binary_sensor.x3_m40d_tailgate_door_state': '\ud83d\udeb9 Portellone',
       'binary_sensor.x3_m40d_tailgate_state': '\ud83d\udeb9 Portellone',
       'binary_sensor.x3_m40d_hood_state': '\ud83d\ude97 Cofano',
@@ -2430,8 +2432,18 @@ function serveHistory() {
         var tyreItems = group.items.filter(function(e) {
           return e.entity_id.includes('tire_pressure') || e.entity_id.includes('axle');
         });
+        function isDoorLeaf(id){
+          var s=String(id||'').toLowerCase();
+          return s.includes('door_state_front_') || s.includes('door_state_rear_') || s.includes('door.row1.') || s.includes('door.row2.');
+        }
+        function isWindowLeaf(id){
+          var s=String(id||'').toLowerCase();
+          return s.includes('window_state_front_') || s.includes('window_state_rear_') || s.includes('window.row1.') || s.includes('window.row2.');
+        }
+        var doorItems=group.items.filter(function(e){return isDoorLeaf(e.entity_id)});
+        var windowItems=group.items.filter(function(e){return isWindowLeaf(e.entity_id)});
         var nonTyreItems = group.items.filter(function(e) {
-          return !(e.entity_id.includes('tire_pressure') || e.entity_id.includes('axle'));
+          return !(e.entity_id.includes('tire_pressure') || e.entity_id.includes('axle') || isDoorLeaf(e.entity_id) || isWindowLeaf(e.entity_id));
         });
         
         // Render grouped tyres as one row
@@ -2448,6 +2460,29 @@ function serveHistory() {
           var pos = tyrePos(t.entity_id);
           var target = (pos === 'Ant. SX' || pos === 'Ant. DX') ? targetF : targetR;
           html += '<div class="ev"><span class="ev-time">' + time + '</span><span class="ev-entity">\ud83d\udd27 Pressione ' + pos + '</span><span><strong>' + t.state + '</strong>' + pressureBar(t.state, target) + ' <small style="color:var(--muted)">kPa</small></span></div>';
+        }
+
+        function normalizedOpenClosed(v){
+          var s=String(v||'').toLowerCase();
+          if(['closed','off','false'].includes(s)) return 'closed';
+          if(['open','on','true'].includes(s)) return 'open';
+          return s;
+        }
+        if(doorItems.length){
+          var doorStates=doorItems.map(function(e){return normalizedOpenClosed(e.state)});
+          var allDoorClosed=doorStates.every(function(s){return s==='closed'});
+          var allDoorOpen=doorStates.every(function(s){return s==='open'});
+          var doorText=allDoorClosed?'Tutte chiuse':(allDoorOpen?'Tutte aperte':'Stato misto');
+          var doorCls=allDoorClosed?'badge-closed':(allDoorOpen?'badge-open':'badge-val');
+          html += '<div class="ev"><span class="ev-time">' + time + '</span><span class="ev-entity">Porte</span><span class="'+doorCls+'">'+doorText+'</span></div>';
+        }
+        if(windowItems.length){
+          var windowStates=windowItems.map(function(e){return normalizedOpenClosed(e.state)});
+          var allWindowClosed=windowStates.every(function(s){return s==='closed'});
+          var allWindowOpen=windowStates.every(function(s){return s==='open'});
+          var windowText=allWindowClosed?'Tutti chiusi':(allWindowOpen?'Tutti aperti':'Stato misto');
+          var windowCls=allWindowClosed?'badge-closed':(allWindowOpen?'badge-open':'badge-val');
+          html += '<div class="ev"><span class="ev-time">' + time + '</span><span class="ev-entity">Finestrini</span><span class="'+windowCls+'">'+windowText+'</span></div>';
         }
         
         // Render non-tyre items
