@@ -1544,281 +1544,184 @@ function serveVehicleInfo() {
 }
 
 
-async function serveTripsData(env, cors) {
-  const db = env.DB;
-  const rows = await db.prepare(
-    `SELECT snapshot_date, mileage_km, mileage_start_km, daily_distance_km, fuel_percent, fuel_litres, range_km 
-     FROM bmw_daily WHERE mileage_km IS NOT NULL ORDER BY snapshot_date DESC LIMIT 90`
-  ).all();
-  
-  // Also get GPS data from bmw_cardata_raw if available
-  const gpsRows = await db.prepare(
-    `SELECT c_timestamp, latitude, longitude FROM bmw_cardata_raw 
-     WHERE latitude IS NOT NULL ORDER BY c_timestamp DESC LIMIT 200`
-  ).all();
-  
-  return new Response(JSON.stringify({
-    trips: rows.results,
-    gps: gpsRows.results
-  }), { headers: { ...cors, 'Content-Type': 'application/json' } });
+
+async function buildDetailedTrips(db, days=90){
+  const cutoff=new Date(Date.now()-days*86400000).toISOString();
+  const raw=await db.prepare(
+    `SELECT snapshot_timestamp, entity_id, state, attributes_json, bmw_timestamp, trigger_reason
+     FROM bmw_raw_daily
+     WHERE snapshot_timestamp >= ?
+     ORDER BY snapshot_timestamp ASC`
+  ).bind(cutoff).all();
+
+  const events=[];
+  const seenEvent=new Set();
+  const mileage=[];
+  const locations=[];
+  let currentLat=null,currentLng=null;
+
+  const pushLoc=(ts,lat,lng)=>{
+    lat=Number(lat);lng=Number(lng);
+    if(!Number.isFinite(lat)||!Number.isFinite(lng)||Math.abs(lat)>90||Math.abs(lng)>180)return;
+    locations.push({ts,lat,lng});
+  };
+
+  for(const r of raw.results){
+    const ts=r.bmw_timestamp||r.snapshot_timestamp;
+    if((r.trigger_reason==='trip_start'||r.trigger_reason==='trip_end') && !seenEvent.has(r.snapshot_timestamp+'|'+r.trigger_reason)){
+      seenEvent.add(r.snapshot_timestamp+'|'+r.trigger_reason);
+      events.push({ts:r.snapshot_timestamp,trigger:r.trigger_reason});
+    }
+    if(r.entity_id==='sensor.x3_m40d_vehicle_mileage'||r.entity_id==='vehicle.vehicle.travelledDistance'){
+      const km=Number(String(r.state).replace(',','.'));
+      if(Number.isFinite(km)&&km>0)mileage.push({ts,km});
+    }
+    if(r.entity_id==='device_tracker.x3_m40d' && r.attributes_json){
+      try{
+        const a=JSON.parse(r.attributes_json);
+        if(Number.isFinite(Number(a.latitude))&&Number.isFinite(Number(a.longitude))) pushLoc(ts,a.latitude,a.longitude);
+      }catch(_){}
+    }
+    if(r.entity_id==='vehicle.cabin.infotainment.navigation.currentLocation.latitude'){
+      const v=Number(String(r.state).replace(',','.')); if(Number.isFinite(v)) currentLat=v;
+      if(currentLat!==null&&currentLng!==null)pushLoc(ts,currentLat,currentLng);
+    }
+    if(r.entity_id==='vehicle.cabin.infotainment.navigation.currentLocation.longitude'){
+      const v=Number(String(r.state).replace(',','.')); if(Number.isFinite(v)) currentLng=v;
+      if(currentLat!==null&&currentLng!==null)pushLoc(ts,currentLat,currentLng);
+    }
+  }
+
+  try{
+    const legacy=await db.prepare(
+      `SELECT c_timestamp, latitude, longitude, travelled_distance
+       FROM bmw_cardata_raw WHERE c_timestamp >= ? ORDER BY c_timestamp ASC`
+    ).bind(cutoff).all();
+    for(const r of legacy.results){
+      if(r.travelled_distance!==null&&Number.isFinite(Number(r.travelled_distance))) mileage.push({ts:r.c_timestamp,km:Number(r.travelled_distance)});
+      if(r.latitude!==null&&r.longitude!==null)pushLoc(r.c_timestamp,r.latitude,r.longitude);
+    }
+  }catch(_){}
+
+  mileage.sort((a,b)=>Date.parse(a.ts)-Date.parse(b.ts));
+  locations.sort((a,b)=>Date.parse(a.ts)-Date.parse(b.ts));
+  events.sort((a,b)=>Date.parse(a.ts)-Date.parse(b.ts));
+
+  const mileageAt=(ts,preferAfter=false)=>{
+    const target=Date.parse(ts); if(!Number.isFinite(target)||!mileage.length)return null;
+    let before=null,after=null;
+    for(const m of mileage){
+      const mt=Date.parse(m.ts);
+      if(mt<=target) before=m;
+      if(mt>=target){after=m;break;}
+    }
+    if(preferAfter&&after&&Date.parse(after.ts)-target<=30*60000)return after;
+    return before||after;
+  };
+  const nearestLoc=ts=>{
+    const target=Date.parse(ts); if(!Number.isFinite(target)||!locations.length)return null;
+    let best=null,bestD=Infinity;
+    for(const p of locations){
+      const d=Math.abs(Date.parse(p.ts)-target);
+      if(d<bestD){best=p;bestD=d;}
+    }
+    return bestD<=3*3600000?best:null;
+  };
+
+  const trips=[];
+  let pending=null;
+  for(const ev of events){
+    if(ev.trigger==='trip_start'){
+      if(!pending) pending=ev;
+      else pending=ev; // a new start closes the old unmatched start logically
+      continue;
+    }
+    if(ev.trigger==='trip_end'&&pending){
+      const sm=mileageAt(pending.ts,false), em=mileageAt(ev.ts,true);
+      const dist=sm&&em&&em.km>=sm.km&&em.km-sm.km<500?Math.round((em.km-sm.km)*10)/10:null;
+      const dur=Math.max(0,Math.round((Date.parse(ev.ts)-Date.parse(pending.ts))/60000));
+      trips.push({
+        startTs:pending.ts,endTs:ev.ts,status:'complete',
+        startKm:sm?sm.km:null,endKm:em?em.km:null,distanceKm:dist,durationMin:dur,
+        startLocation:nearestLoc(pending.ts),endLocation:nearestLoc(ev.ts)
+      });
+      pending=null;
+    }
+  }
+  if(pending){
+    const sm=mileageAt(pending.ts,false), em=mileage.length?mileage[mileage.length-1]:null;
+    const dist=sm&&em&&em.km>=sm.km&&em.km-sm.km<500?Math.round((em.km-sm.km)*10)/10:null;
+    trips.push({
+      startTs:pending.ts,endTs:null,status:'in_progress',
+      startKm:sm?sm.km:null,endKm:em?em.km:null,distanceKm:dist,durationMin:Math.max(0,Math.round((Date.now()-Date.parse(pending.ts))/60000)),
+      startLocation:nearestLoc(pending.ts),endLocation:locations.length?locations[locations.length-1]:null
+    });
+  }
+
+  const labelCache=new Map();
+  const labelFor=async p=>{
+    if(!p)return null;
+    const key=Number(p.lat).toFixed(4)+','+Number(p.lng).toFixed(4);
+    if(labelCache.has(key))return labelCache.get(key);
+    const g=await getLocationLabel(db,p);
+    const label=g&&g.label?g.label:null;
+    labelCache.set(key,label);
+    return label;
+  };
+  for(const t of trips.slice(-80)){
+    t.from=await labelFor(t.startLocation);
+    t.to=await labelFor(t.endLocation);
+  }
+
+  return trips.sort((a,b)=>Date.parse(b.startTs)-Date.parse(a.startTs));
 }
 
+async function serveTripsData(env, cors) {
+  const trips=await buildDetailedTrips(env.DB,90);
+  const complete=trips.filter(t=>t.status==='complete');
+  const totalKm=Math.round(complete.reduce((s,t)=>s+(Number(t.distanceKm)||0),0)*10)/10;
+  return jsonResponse({
+    trips,
+    summary:{
+      count:complete.length,
+      totalKm,
+      averageKm:complete.length?Math.round(totalKm/complete.length*10)/10:0,
+      latest:trips.length?trips[0].startTs:null
+    }
+  },200,cors);
+}
 
 function serveTrips() {
   const html = `<!DOCTYPE html>
-<html lang="it">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>BMW X3 M40d \u00b7 Viaggi</title>
-  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"><\/script>
-  <style>
-    :root{--bg:#0a1726;--card:#111d2e;--text:#e4ecf5;--muted:#7b93a8;--accent:#438eff;--line:rgba(39,71,102,.4);--green:#2ea55c;--amber:#f5a623;--red:#e05252}
-    *{margin:0;padding:0;box-sizing:border-box}
-    body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:var(--bg);color:var(--text);min-height:100vh}
-    .topbar{position:sticky;top:0;z-index:100;backdrop-filter:blur(18px);background:rgba(10,23,38,.85);padding:16px 24px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--line)}
-    .topbar a{color:var(--accent);text-decoration:none;font-size:14px;display:flex;align-items:center;gap:6px}
-    .topbar h1{font-size:18px;font-weight:700}
-    .shell{max-width:1200px;margin:0 auto;padding:24px 20px}
-    #mapTrips{height:300px;border-radius:14px;margin-bottom:24px;border:1px solid var(--line)}
-    .stats-row{display:flex;gap:12px;margin-bottom:24px;flex-wrap:wrap}
-    .stat-card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px 18px;flex:1;min-width:120px}
-    .stat-card small{color:var(--muted);font-size:11px;display:block;margin-bottom:4px}
-    .stat-card strong{font-size:20px;font-weight:800}
-    .stat-card .sub{font-size:11px;color:var(--muted);margin-top:2px}
-    table{width:100%;border-collapse:collapse;font-size:13px}
-    thead{position:sticky;top:56px;background:var(--bg);z-index:10}
-    th{text-align:left;padding:8px 10px;color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.5px;border-bottom:2px solid var(--line)}
-    td{padding:8px 10px;border-bottom:1px solid var(--line)}
-    tr:hover{background:rgba(67,142,255,.06)}
-    tr.refuel-row{background:rgba(46,165,92,.08)}
-    tr.refuel-row:hover{background:rgba(46,165,92,.14)}
-    .km-bar{display:inline-block;height:6px;border-radius:3px;background:var(--accent);vertical-align:middle;min-width:2px}
-    .fuel-badge{display:inline-block;padding:2px 8px;border-radius:6px;font-size:11px;font-weight:700}
-    .fuel-green{background:rgba(46,165,92,.15);color:#69e1b2}
-    .fuel-amber{background:rgba(245,166,35,.15);color:#f5c56a}
-    .fuel-red{background:rgba(224,82,82,.15);color:#f08080}
-    .refuel-badge{display:inline-flex;align-items:center;gap:4px;background:rgba(46,165,92,.18);color:#69e1b2;padding:3px 10px;border-radius:8px;font-size:12px;font-weight:700}
-    .no-trip{color:var(--muted);font-style:italic}
-    .loading{text-align:center;padding:40px;color:var(--muted)}
-    .refuel-section{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px 22px;margin-bottom:24px}
-    .refuel-section h3{font-size:14px;font-weight:700;margin-bottom:12px;color:var(--green)}
-    .refuel-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px}
-    .refuel-item{background:rgba(46,165,92,.08);border:1px solid rgba(46,165,92,.2);border-radius:10px;padding:10px 14px}
-    .refuel-item .date{font-weight:700;font-size:13px}
-    .refuel-item .detail{font-size:12px;color:var(--muted);margin-top:4px}
-    @media(max-width:700px){.stats-row{flex-direction:column}th,td{padding:6px 4px;font-size:11px}.refuel-list{grid-template-columns:1fr}}
-  </style>
-</head>
-<body>
-  <header class="topbar">
-    <a href="/">\u2190 Dashboard</a>
-    <h1>\ud83d\uddfa\ufe0f Viaggi e Rifornimenti</h1>
-    <span style="width:80px"></span>
-  </header>
-  <main class="shell">
-    <div id="mapTrips"></div>
-    <div class="stats-row">
-      <div class="stat-card"><small>Periodo</small><strong id="statPeriod">\u2014</strong></div>
-      <div class="stat-card"><small>Km totali</small><strong id="statKm">\u2014</strong></div>
-      <div class="stat-card"><small>Giorni guida</small><strong id="statDays">\u2014</strong></div>
-      <div class="stat-card"><small>Media km/giorno</small><strong id="statAvg">\u2014</strong></div>
-      <div class="stat-card"><small>Consumo medio</small><strong id="statConsumption">\u2014</strong><div class="sub" id="statConsumptionSub"></div></div>
-      <div class="stat-card"><small>Rifornimenti</small><strong id="statRefuels">\u2014</strong><div class="sub" id="statRefuelSub"></div></div>
-    </div>
-    <div id="refuelSection" class="refuel-section" style="display:none">
-      <h3>\u26fd Storico rifornimenti</h3>
-      <div class="refuel-list" id="refuelList"></div>
-    </div>
-    <div class="loading" id="loading">Caricamento viaggi...</div>
-    <table style="display:none" id="tripsTable">
-      <thead>
-        <tr><th>Data</th><th>Km</th><th></th><th>Carburante</th><th>L consumati</th><th>Consumo</th><th>Km da riforn.</th><th>Note</th></tr>
-      </thead>
-      <tbody id="tripsBody"></tbody>
-    </table>
-  </main>
-  <script>
-    var map = L.map('mapTrips',{zoomControl:true,attributionControl:false}).setView([39.36,9.01],10);
-    L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',{maxZoom:19}).addTo(map);
-
-    fetch('/api/trips').then(function(r){return r.json()}).then(function(data){
-      var trips = data.trips || [];
-      if (!trips.length) { document.getElementById('loading').textContent='Nessun dato'; return; }
-      
-      trips.reverse(); // oldest first
-      
-      // === FUEL & REFUEL CALCULATIONS ===
-      var totalKm=0, activeDays=0, maxKm=0;
-      var totalLitresUsed=0, totalKmWithFuel=0;
-      var refuels=[];
-      var lastRefuelKm = trips[0].mileage_km || 0;
-      var lastRefuelDate = trips[0].snapshot_date;
-      
-      trips.forEach(function(t, i){
-        var km = t.daily_distance_km || 0;
-        totalKm += km;
-        if(km > 0) activeDays++;
-        if(km > maxKm) maxKm = km;
-        
-        t._litresUsed = null;
-        t._consumption = null;
-        t._refuel = false;
-        t._refuelAmount = 0;
-        t._kmSinceRefuel = (t.mileage_km || 0) - lastRefuelKm;
-        
-        if (i === 0) return;
-        var prev = trips[i-1];
-        
-        // Fuel delta (both must have fuel data)
-        if (t.fuel_litres !== null && t.fuel_litres !== undefined && 
-            prev.fuel_litres !== null && prev.fuel_litres !== undefined) {
-          var delta = prev.fuel_litres - t.fuel_litres; // positive = consumed
-          
-          if (delta < -3) { // fuel went up by >3L = refuel detected
-            t._refuel = true;
-            t._refuelAmount = Math.round(Math.abs(delta));
-            var kmSinceLastRefuel = (t.mileage_km || 0) - lastRefuelKm;
-            refuels.push({
-              date: t.snapshot_date,
-              litres: t._refuelAmount,
-              fuelAfter: t.fuel_litres,
-              fuelPct: t.fuel_percent,
-              kmSince: kmSinceLastRefuel,
-              kmAt: t.mileage_km
-            });
-            lastRefuelKm = t.mileage_start_km || t.mileage_km;
-            lastRefuelDate = t.snapshot_date;
-            t._kmSinceRefuel = 0;
-          } else if (delta > 0) {
-            t._litresUsed = Math.round(delta * 10) / 10;
-            totalLitresUsed += delta;
-            totalKmWithFuel += km;
-          }
-        }
-        
-        // Consumption L/100km
-        if (km > 0 && t._litresUsed > 0) {
-          t._consumption = (t._litresUsed / km * 100).toFixed(1);
-        }
-      });
-      
-      // === STATS ===
-      var months=['gen','feb','mar','apr','mag','giu','lug','ago','set','ott','nov','dic'];
-      
-      document.getElementById('statPeriod').textContent = trips[0].snapshot_date.substring(5) + ' \u2192 ' + trips[trips.length-1].snapshot_date.substring(5);
-      document.getElementById('statKm').textContent = totalKm.toLocaleString('it') + ' km';
-      document.getElementById('statDays').textContent = activeDays + '/' + trips.length;
-      document.getElementById('statAvg').textContent = activeDays > 0 ? Math.round(totalKm/activeDays) + ' km' : '\u2014';
-      
-      var avgConsumption = totalLitresUsed > 0 ? (totalKmWithFuel / totalLitresUsed).toFixed(1) : null;
-      document.getElementById('statConsumption').textContent = avgConsumption ? avgConsumption + ' km/L' : '\u2014';
-      document.getElementById('statConsumptionSub').textContent = totalLitresUsed > 0 ? Math.round(totalLitresUsed) + 'L su ' + Math.round(totalKmWithFuel) + ' km' : '';
-      
-      document.getElementById('statRefuels').textContent = refuels.length;
-      if (refuels.length > 0) {
-        var avgKmBetween = Math.round(refuels.reduce(function(s,r){return s+r.kmSince},0) / refuels.length);
-        document.getElementById('statRefuelSub').textContent = 'ogni ~' + avgKmBetween + ' km';
-      }
-      
-      // === REFUEL CARDS ===
-      if (refuels.length > 0) {
-        document.getElementById('refuelSection').style.display = 'block';
-        var rl = document.getElementById('refuelList');
-        refuels.forEach(function(r){
-          var d = new Date(r.date + 'T12:00:00');
-          var dateStr = d.getDate() + ' ' + months[d.getMonth()] + ' ' + d.getFullYear();
-          var div = document.createElement('div');
-          div.className = 'refuel-item';
-          div.innerHTML = '<div class="date">\u26fd ' + dateStr + '</div>' +
-            '<div class="detail">+' + r.litres + 'L \u2192 ' + r.fuelAfter + 'L (' + (r.fuelPct||'?') + '%)</div>' +
-            '<div class="detail">' + r.kmSince.toLocaleString('it') + ' km dal precedente \u00b7 a ' + (r.kmAt||0).toLocaleString('it') + ' km</div>';
-          rl.appendChild(div);
-        });
-      }
-      
-      // === TABLE ===
-      var tbody = document.getElementById('tripsBody');
-      trips.forEach(function(t){
-        var km = t.daily_distance_km || 0;
-        var d = new Date(t.snapshot_date + 'T12:00:00');
-        var dateStr = d.getDate() + ' ' + months[d.getMonth()] + ' ' + d.getFullYear();
-        var dayName = d.toLocaleDateString('it-IT',{weekday:'short'});
-        var barW = maxKm > 0 ? Math.round((km/maxKm)*100) : 0;
-        
-        // Fuel display
-        var fuelStr = '\u2014';
-        if (t.fuel_percent !== null && t.fuel_percent !== undefined) {
-          fuelStr = t.fuel_percent + '% (' + (t.fuel_litres||'?') + 'L)';
-        }
-        
-        // Litres used
-        var litresStr = '\u2014';
-        if (t._litresUsed !== null) litresStr = t._litresUsed.toFixed(1) + ' L';
-        
-        // Consumption with color
-        var consStr = '\u2014';
-        if (t._consumption !== null) {
-          var c = parseFloat(t._consumption);
-          var cls = c > 12 ? 'fuel-red' : c > 9 ? 'fuel-amber' : 'fuel-green';
-          var kmL = Number(t._consumption)>0 ? (100/Number(t._consumption)).toFixed(1) : null;
-          consStr = kmL ? '<span class="fuel-badge ' + cls + '">' + kmL + ' km/L</span>' : '—';
-        }
-        
-        // Km since refuel
-        var kmRefuelStr = t._kmSinceRefuel > 0 ? t._kmSinceRefuel.toLocaleString('it') + ' km' : '\u2014';
-        
-        // Note
-        var noteStr = '';
-        if (t._refuel) {
-          noteStr = '<span class="refuel-badge">\u26fd +' + t._refuelAmount + 'L</span>';
-        } else if (km === 0) {
-          noteStr = '<span style="color:var(--muted);font-size:11px">Fermo</span>';
-        }
-        
-        var tr = document.createElement('tr');
-        if (t._refuel) tr.className = 'refuel-row';
-        tr.innerHTML = '<td><strong>' + dateStr + '</strong><br><span style="color:var(--muted);font-size:11px">' + dayName + '</span></td>'
-          + '<td>' + (km > 0 ? '<strong>' + km + '</strong>' : '<span class="no-trip">0</span>') + '</td>'
-          + '<td><span class="km-bar" style="width:' + barW + 'px"></span></td>'
-          + '<td>' + fuelStr + '</td>'
-          + '<td>' + litresStr + '</td>'
-          + '<td>' + consStr + '</td>'
-          + '<td>' + kmRefuelStr + '</td>'
-          + '<td>' + noteStr + '</td>';
-        tbody.appendChild(tr);
-      });
-      
-      document.getElementById('loading').style.display='none';
-      document.getElementById('tripsTable').style.display='table';
-      
-      // === MAP ===
-      if (data.gps && data.gps.length) {
-        var points = [];
-        data.gps.forEach(function(g){
-          if(g.latitude && g.longitude) points.push([g.latitude, g.longitude]);
-        });
-        if (points.length) {
-          L.polyline(points, {color:'#438eff',weight:3,opacity:0.7}).addTo(map);
-          points.forEach(function(p,i){
-            if(i===0 || i===points.length-1) L.circleMarker(p,{radius:6,color:'#438eff',fillColor:'#69e1b2',fillOpacity:1}).addTo(map);
-          });
-          map.fitBounds(L.latLngBounds(points).pad(0.1));
-        }
-      }
-      setTimeout(function(){map.invalidateSize()},200);
-    }).catch(function(e){
-      document.getElementById('loading').textContent='Errore: '+e.message;
-    });
-  <\/script>
-</body>
-</html>`;
-  return new Response(html, {
-    headers: { 'Content-Type': 'text/html;charset=utf-8', 'Cache-Control': 'public, max-age=300' }
-  });
+<html lang="it"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>BMW X3 M40d · Viaggi</title>
+<style>
+:root{--bg:#07111d;--card:#0c1b2d;--text:#f4f7fb;--muted:#9fb2c7;--blue:#3f8cff;--line:#274766;--green:#64e78b;--amber:#ffc65b}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.shell{max-width:1100px;margin:auto;padding:24px 18px}.top{display:flex;justify-content:space-between;align-items:center;margin-bottom:22px}.top a{color:var(--blue);text-decoration:none}.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:20px}.stat,.trip{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:15px}.stat small{display:block;color:var(--muted);font-size:11px;text-transform:uppercase}.stat strong{display:block;font-size:24px;margin-top:4px}.trips{display:grid;gap:10px}.trip{display:grid;grid-template-columns:145px 1fr 1fr 90px 90px;gap:12px;align-items:center}.when{font-weight:700}.sub{font-size:12px;color:var(--muted);margin-top:3px}.place{font-weight:700}.arrow{color:var(--muted);font-size:11px}.km{font-size:20px;font-weight:800}.badge{display:inline-block;font-size:11px;padding:3px 7px;border-radius:8px;background:rgba(255,198,91,.12);color:var(--amber)}.empty{padding:40px;text-align:center;color:var(--muted)}
+@media(max-width:760px){.stats{grid-template-columns:1fr 1fr}.trip{grid-template-columns:1fr 1fr}.trip .route{grid-column:1/-1}.trip .km,.trip .duration{text-align:left}}
+</style></head><body><main class="shell"><div class="top"><a href="/">← Dashboard</a><h1>🗺️ Viaggi</h1></div>
+<div class="stats"><div class="stat"><small>Viaggi completi</small><strong id="count">—</strong></div><div class="stat"><small>Km registrati</small><strong id="total">—</strong></div><div class="stat"><small>Media per viaggio</small><strong id="avg">—</strong></div></div>
+<div class="trips" id="list"><div class="empty">Caricamento viaggi…</div></div>
+</main><script>
+function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+function fmtTs(ts){if(!ts)return '—';var d=new Date(ts);return d.toLocaleDateString('it-IT',{weekday:'short',day:'2-digit',month:'short'})+' · '+d.toLocaleTimeString('it-IT',{hour:'2-digit',minute:'2-digit'})}
+function dur(m){if(m===null||m===undefined)return '—';if(m<60)return m+' min';return Math.floor(m/60)+'h '+(m%60)+'m'}
+fetch('/api/trips').then(r=>r.json()).then(data=>{
+ var s=data.summary||{};document.getElementById('count').textContent=s.count??0;document.getElementById('total').textContent=(s.totalKm??0).toLocaleString('it-IT')+' km';document.getElementById('avg').textContent=(s.averageKm??0).toLocaleString('it-IT')+' km';
+ var trips=data.trips||[];var list=document.getElementById('list');
+ if(!trips.length){list.innerHTML='<div class="empty">Nessun viaggio registrato</div>';return}
+ list.innerHTML=trips.map(t=>{
+   var status=t.status==='in_progress'?'<span class="badge">in corso</span>':'';
+   return '<article class="trip"><div><div class="when">'+esc(fmtTs(t.startTs))+'</div><div class="sub">'+status+'</div></div>'+
+    '<div class="route"><div class="arrow">DA</div><div class="place">'+esc(t.from||'Posizione non disponibile')+'</div></div>'+
+    '<div class="route"><div class="arrow">A</div><div class="place">'+esc(t.to||'Posizione non disponibile')+'</div></div>'+
+    '<div class="km">'+(t.distanceKm==null?'—':Number(t.distanceKm).toLocaleString('it-IT')+' km')+'</div>'+
+    '<div class="duration"><div class="arrow">DURATA</div><strong>'+dur(t.durationMin)+'</strong></div></article>'
+ }).join('');
+}).catch(e=>{document.getElementById('list').innerHTML='<div class="empty">Errore: '+esc(e.message)+'</div>'});
+<\/script></body></html>`;
+  return new Response(html,{headers:{'Content-Type':'text/html;charset=utf-8','Cache-Control':'no-store'}});
 }
-
 
 
 async function serveFuelData(env, cors) {
