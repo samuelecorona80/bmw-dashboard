@@ -1987,11 +1987,12 @@ function serveFuel() {
     // Refuel table
     var rt=document.getElementById('refuelTable');
     if(refuels.length>0){
-      var h='<table><thead><tr><th>Data</th><th>Litri aggiunti</th><th>Livello dopo</th><th>Costo stimato</th></tr></thead><tbody>';
+      var h='<table><thead><tr><th>Quando</th><th>Litri aggiunti</th><th>Livello</th><th>Odometro</th></tr></thead><tbody>';
       refuels.forEach(function(r){
-        var d=new Date(r.date+'T12:00:00');
-        var ds=d.getDate()+' '+months[d.getMonth()]+' '+d.getFullYear();
-        h+='<tr class="refuel-row"><td><strong>'+ds+'</strong></td><td class="badge-green">+'+Math.round(r.added)+' L</td><td>'+Math.round(r.after)+' L ('+r.pctAfter+'%)</td><td>\u20ac '+(r.added*DIESEL_PRICE).toFixed(2)+'</td></tr>';
+        var d=r.timestamp?new Date(r.timestamp):new Date((r.date||'')+'T12:00:00');
+        var ds=isNaN(d.getTime())?'—':d.toLocaleString('it-IT',{day:'2-digit',month:'short',year:'numeric',hour:'2-digit',minute:'2-digit'});
+        var level=(r.before!=null&&r.after!=null)?(Number(r.before).toFixed(1)+' → '+Number(r.after).toFixed(1)+' L'):(r.after!=null?Number(r.after).toFixed(1)+' L':'—');
+        h+='<tr class="refuel-row"><td><strong>'+ds+'</strong></td><td class="badge-green">+'+Number(r.added).toFixed(1)+' L</td><td>'+level+'</td><td>'+(r.km?Number(r.km).toLocaleString('it-IT')+' km':'—')+'</td></tr>';
       });
       h+='</tbody></table>';
       rt.innerHTML=h;
