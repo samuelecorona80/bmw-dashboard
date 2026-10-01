@@ -624,7 +624,7 @@ async function enrichRefuelsWithStation(db, refuels){
         const d=Math.abs(Date.parse(p.ts)-t);
         if(d<bestD){best=p;bestD=d}
       }
-      return bestD<=2*3600000?best:null;
+      return bestD<=45*60000 && best ? {...best,ageMinutes:Math.round(bestD/60000)} : null;
     };
 
     const stationsRes=await fetch('https://carburanti.samuelecorona.it/data/stations.json',{cf:{cacheTtl:1800,cacheEverything:true}});
@@ -645,7 +645,10 @@ async function enrichRefuelsWithStation(db, refuels){
       const exact=pts.find(p=>Array.isArray(p)&&p[0]===dateKey);
       if(exact&&Number.isFinite(Number(exact[1]))) return {price:Number(exact[1])/1000,source:'storico stazione',date:exact[0]};
       const before=pts.filter(p=>Array.isArray(p)&&p[0]<=dateKey&&Number.isFinite(Number(p[1]))).slice(-1)[0];
-      if(before) return {price:Number(before[1])/1000,source:'ultimo prezzo stazione disponibile',date:before[0]};
+      if(before){
+        const ageDays=Math.round((Date.parse(dateKey+'T12:00:00Z')-Date.parse(before[0]+'T12:00:00Z'))/86400000);
+        if(ageDays<=7) return {price:Number(before[1])/1000,source:'ultimo prezzo stazione disponibile',date:before[0]};
+      }
       return null;
     };
 
@@ -663,12 +666,12 @@ async function enrichRefuelsWithStation(db, refuels){
       const best=candidates[0]||null, second=candidates[1]||null;
       // Strong match when the car is physically at/next to the station. If two
       // stations are almost equally close, keep the match explicitly uncertain.
-      if(!best || best.km>0.45){out.push({...r,location:loc,stationMatch:null});continue}
-      const ambiguous=Boolean(second&&second.km<0.45&&Math.abs(second.km-best.km)<0.08);
+      if(!best || best.km>0.30){out.push({...r,location:loc,stationMatch:null});continue}
+      const ambiguous=Boolean(second&&second.km<0.30&&Math.abs(second.km-best.km)<0.06);
       const day=dateKeyInRome(r.timestamp);
       const historical=await loadHistoricalPrice(best.s.id,day);
       const currentPrice=Number(best.s?.prezzi?.Gasolio?.self);
-      const price=historical?.price||(Number.isFinite(currentPrice)?currentPrice:null);
+      const price=historical?.price||((day===dateKeyInRome(new Date())&&Number.isFinite(currentPrice))?currentPrice:null);
       const cost=price&&r.litresEstimated?Math.round(price*Number(r.litresEstimated)*100)/100:null;
       out.push({
         ...r,
@@ -680,8 +683,9 @@ async function enrichRefuelsWithStation(db, refuels){
           operator:best.s.gestore||null,
           address:[best.s.indirizzo,best.s.comune,best.s.provincia].filter(Boolean).join(' · '),
           distanceM:Math.round(best.km*1000),
-          confidence:ambiguous?'incerta':(best.km<=0.15?'alta':'probabile'),
+          confidence:ambiguous?'incerta':(best.km<=0.12&&loc.ageMinutes<=15?'alta':'probabile'),
           ambiguous,
+          locationAgeMinutes:loc.ageMinutes,
           priceEur:price,
           priceDate:historical?.date||null,
           priceSource:historical?.source||(price?'prezzo corrente stazione':null),
@@ -2079,7 +2083,9 @@ function serveFuel() {
           before:r.beforeLitres,
           pctAfter:null,
           km:r.odometerKm,
-          source:r.source||'BMW'
+          source:r.source||'BMW',
+          stationMatch:r.stationMatch||null,
+          location:r.location||null
         };
       });
     }
@@ -2097,8 +2103,17 @@ function serveFuel() {
     document.getElementById('sLitres').textContent=totalL>0?Math.round(totalL)+' L':'\u2014';
     document.getElementById('sKmL').textContent=totalL>0?(totalKmF/totalL).toFixed(1):'\u2014';
     document.getElementById('sRefuels').textContent=refuels.length;
-    var totalRefuelL=0; refuels.forEach(function(r){totalRefuelL+=r.added});
-    document.getElementById('sRefuelCost').textContent=totalRefuelL>0?'\u20ac '+(totalRefuelL*DIESEL_PRICE).toFixed(0)+' stimati':'';
+    var totalRefuelL=0,totalKnownCost=0,costCount=0;
+    refuels.forEach(function(r){
+      totalRefuelL+=Number(r.added)||0;
+      if(r.stationMatch&&r.stationMatch.costEur){
+        totalKnownCost+=Number(r.stationMatch.costEur);
+        costCount++;
+      }
+    });
+    document.getElementById('sRefuelCost').textContent=costCount
+      ? totalKnownCost.toLocaleString('it-IT',{style:'currency',currency:'EUR'})+' · '+costCount+' riforniment'+(costCount===1?'o':'i')+' valorizzat'+(costCount===1?'o':'i')
+      : 'costo non ricostruibile con affidabilità';
 
     // Chart 1: Consumption bars
     if(cPoints.length>0){
@@ -2137,7 +2152,7 @@ function serveFuel() {
         var d=r.timestamp?new Date(r.timestamp):new Date((r.date||'')+'T12:00:00');
         var ds=isNaN(d.getTime())?'—':d.toLocaleString('it-IT',{day:'2-digit',month:'short',year:'numeric',hour:'2-digit',minute:'2-digit'});
         var sm=r.stationMatch||null;
-        var station=sm?('<strong>'+sm.name+'</strong><div class="sub">'+(sm.address||'')+(sm.distanceM!=null?' · '+sm.distanceM+' m':'')+' · '+(sm.confidence||'')+'</div>'):'<span class="sub">Stazione non identificata</span>';
+        var station=sm?('<strong>'+sm.name+'</strong><div class="sub">'+(sm.address||'')+(sm.distanceM!=null?' · '+sm.distanceM+' m':'')+' · '+(sm.confidence||'')+(sm.locationAgeMinutes!=null?' · GPS '+sm.locationAgeMinutes+' min':'')+'</div>'):'<span class="sub">Stazione non identificata</span>';
         var price=sm&&sm.priceEur?Number(sm.priceEur).toLocaleString('it-IT',{minimumFractionDigits:3,maximumFractionDigits:3})+' €/L':'—';
         var cost=sm&&sm.costEur?Number(sm.costEur).toLocaleString('it-IT',{style:'currency',currency:'EUR'}):'—';
         var priceNote=sm&&sm.priceSource?'<div class="sub">'+sm.priceSource+(sm.priceDate?' · '+sm.priceDate:'')+'</div>':'';
@@ -2312,7 +2327,13 @@ function serveHistory() {
     .cat-pill:hover{border-color:var(--accent)}
     .cat-pill.active{background:rgba(67,142,255,.2);color:var(--accent);border-color:var(--accent)}
     .stats-bar{display:flex;gap:16px;margin-bottom:16px;font-size:12px;color:var(--muted)}
-    .state-title{font-size:13px;font-weight:800;margin:18px 0 10px}.state-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px;margin-bottom:18px}.state-card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:13px}.state-head{display:flex;justify-content:space-between;gap:8px;align-items:center}.state-name{font-weight:700;font-size:13px}.state-now{font-size:11px;font-weight:800;padding:4px 8px;border-radius:999px}.state-now.closed{background:rgba(46,165,92,.16);color:#5cf29c}.state-now.open{background:rgba(255,87,87,.16);color:#ff7575}.state-now.unknown{background:rgba(123,147,168,.15);color:var(--muted)}.state-times{margin-top:9px;display:grid;gap:4px;font-size:11px;color:var(--muted)}.state-times b{color:var(--text);font-weight:600}
+    .state-title{font-size:13px;font-weight:800;margin:18px 0 10px}
+    .vehicle-board{display:grid;grid-template-columns:minmax(170px,1fr) 150px minmax(170px,1fr);grid-template-rows:auto auto auto auto auto auto;gap:10px 14px;align-items:center;margin-bottom:20px}
+    .vehicle-silhouette{grid-column:2;grid-row:2/6;align-self:stretch;min-height:330px;border:1px solid rgba(67,142,255,.35);border-radius:46px 46px 58px 58px;background:linear-gradient(180deg,rgba(67,142,255,.14),rgba(17,29,46,.65));position:relative;box-shadow:inset 0 0 35px rgba(67,142,255,.08)}
+    .vehicle-silhouette:before{content:'BMW X3';position:absolute;inset:45% 0 auto;text-align:center;color:var(--muted);font-size:12px;font-weight:800;letter-spacing:.12em}
+    .state-card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:11px;min-width:0}.state-head{display:flex;justify-content:space-between;gap:8px;align-items:center}.state-name{font-weight:700;font-size:12px}.state-now{font-size:10px;font-weight:800;padding:4px 7px;border-radius:999px;white-space:nowrap}.state-now.closed{background:rgba(46,165,92,.16);color:#5cf29c}.state-now.open{background:rgba(255,87,87,.16);color:#ff7575}.state-now.unknown{background:rgba(123,147,168,.15);color:var(--muted)}.state-times{margin-top:7px;display:grid;gap:3px;font-size:10px;color:var(--muted)}.state-times b{color:var(--text);font-weight:600}
+    .pos-cofano{grid-column:2;grid-row:1}.pos-tetto{grid-column:2;grid-row:3;z-index:2;margin:0 12px}.pos-porta-ant-sx{grid-column:1;grid-row:2}.pos-porta-ant-dx{grid-column:3;grid-row:2}.pos-fin-ant-sx{grid-column:1;grid-row:3}.pos-fin-ant-dx{grid-column:3;grid-row:3}.pos-fin-post-sx{grid-column:1;grid-row:4}.pos-fin-post-dx{grid-column:3;grid-row:4}.pos-porta-post-sx{grid-column:1;grid-row:5}.pos-porta-post-dx{grid-column:3;grid-row:5}.pos-portellone{grid-column:2;grid-row:6}
+    @media(max-width:700px){.vehicle-board{grid-template-columns:1fr 92px 1fr;gap:8px}.vehicle-silhouette{min-height:300px}.state-name{font-size:11px}.state-times{font-size:9px}.state-now{font-size:9px;padding:3px 5px}}
     .event-list{border:1px solid var(--line);border-radius:12px;overflow:hidden}
     .date-sep{padding:10px 16px;background:rgba(67,142,255,.06);font-size:11px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;border-bottom:1px solid var(--line)}
     .ev{display:grid;grid-template-columns:90px 1fr auto;gap:8px;padding:10px 16px;border-bottom:1px solid rgba(39,71,102,.25);align-items:center;font-size:13px;transition:background .15s}
@@ -2354,7 +2375,7 @@ function serveHistory() {
       <button class="cat-pill" data-cat="climate" onclick="setCat('climate')">\u2744\ufe0f Clima</button>
     </div>
     <div class="state-title">Stato aperture</div>
-    <div id="stateGrid" class="state-grid"><div class="loading">Caricamento stato…</div></div>
+    <div id="stateGrid" class="vehicle-board"><div class="vehicle-silhouette"></div><div class="loading" style="grid-column:1/-1">Caricamento stato…</div></div>
     <div class="stats-bar">
       <span id="statsCount">Caricamento...</span>
       <span id="statsDedup"></span>
@@ -2507,11 +2528,14 @@ function serveHistory() {
       var stateNames={porta_ant_sx:'Porta ant. sinistra',porta_ant_dx:'Porta ant. destra',porta_post_sx:'Porta post. sinistra',porta_post_dx:'Porta post. destra',finestrino_ant_sx:'Finestrino ant. sinistro',finestrino_ant_dx:'Finestrino ant. destro',finestrino_post_sx:'Finestrino post. sinistro',finestrino_post_dx:'Finestrino post. destro',portellone:'Portellone',cofano:'Cofano',tetto:'Tetto apribile'};
       function shortDt(ts){if(!ts)return 'mai rilevato';var d=new Date(ts);return d.toLocaleString('it-IT',{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'})}
       var ss=data.openingSummary||[];
-      document.getElementById('stateGrid').innerHTML=ss.length?ss.map(function(x){
+      var posClass={cofano:'pos-cofano',tetto:'pos-tetto',portellone:'pos-portellone',porta_ant_sx:'pos-porta-ant-sx',porta_ant_dx:'pos-porta-ant-dx',porta_post_sx:'pos-porta-post-sx',porta_post_dx:'pos-porta-post-dx',finestrino_ant_sx:'pos-fin-ant-sx',finestrino_ant_dx:'pos-fin-ant-dx',finestrino_post_sx:'pos-fin-post-sx',finestrino_post_dx:'pos-fin-post-dx'};
+      var cards=ss.map(function(x){
         var cls=x.current==='closed'?'closed':(x.current==='open'?'open':'unknown');
         var label=x.current==='closed'?'Chiuso':(x.current==='open'?'APERTO':'N.d.');
-        return '<div class="state-card"><div class="state-head"><span class="state-name">'+(stateNames[x.key]||x.key)+'</span><span class="state-now '+cls+'">'+label+'</span></div><div class="state-times"><span>Ultima apertura: <b>'+shortDt(x.lastOpen)+'</b></span><span>Ultima chiusura: <b>'+shortDt(x.lastClosed)+'</b></span><span>Stato rilevato: <b>'+shortDt(x.currentAt)+'</b></span></div></div>';
-      }).join(''):'<div class="loading">Nessuno stato aperture disponibile</div>';
+        var pc=posClass[x.key]||'';
+        return '<div class="state-card '+pc+'"><div class="state-head"><span class="state-name">'+(stateNames[x.key]||x.key)+'</span><span class="state-now '+cls+'">'+label+'</span></div><div class="state-times"><span>Aperta: <b>'+shortDt(x.lastOpen)+'</b></span><span>Chiusa: <b>'+shortDt(x.lastClosed)+'</b></span></div></div>';
+      }).join('');
+      document.getElementById('stateGrid').innerHTML=ss.length?('<div class="vehicle-silhouette"></div>'+cards):'<div class="loading" style="grid-column:1/-1">Nessuno stato aperture disponibile</div>';
       
       if (!events.length) {
         document.getElementById('eventList').innerHTML = '<div class="loading">Nessun evento per questa categoria</div>';
