@@ -690,16 +690,9 @@ a{color:#7eb5ff}.muted{color:#9fb2c7}.ok{color:#78e39b}.bad{color:#ff9a9a}
   <div id="quota" class="muted">Caricamento\u2026</div>
 </div>
 <div class="card">
-  <h3>2. Autorizzazione BMW</h3>
-  <button onclick="startAuth()">Avvia Device Code Flow</button>
-  <div id="auth" class="muted">Non avviato.</div>
-  <button onclick="pollAuth()">Ho autorizzato \xB7 verifica</button>
-</div>
-<div class="card">
-  <h3>3. Test REST diretto</h3>
-  <button onclick="fetchNow()">Esegui fetch BMW</button>
-  <button onclick="copyPre('fetch',this)">Copia fetch</button>
-  <pre id="fetch">Non eseguito.</pre>
+  <h3>2. BMW Direct</h3>
+  <div class="ok"><b>Disattivato come sorgente automatica</b></div>
+  <div class="muted" style="margin-top:8px">Per i dati recenti viene usato Home Assistant / BavarianData. Lo storico ufficiale BMW resta conservato in D1. Nessun cron BMW Direct è attivo.</div>
 </div>
 <p><a href="/">\u2190 Dashboard</a></p>
 <script>
@@ -735,12 +728,13 @@ async function status(){
   const q=x.j.apiQuota;
   if(q){
     var remote='';
-    if(q.remoteRateLimitedAt){
+    var remoteActive=q.remoteEstimatedReset && new Date(q.remoteEstimatedReset).getTime()>Date.now();
+    if(remoteActive){
       remote='<br><span class="bad"><b>BMW segnala quota esaurita</b> dal '+new Date(q.remoteRateLimitedAt).toLocaleString('it-IT')+'</span>';
       if(q.remoteRetryAfter) remote+=' \xB7 Retry-After: '+q.remoteRetryAfter;
-      if(q.remoteEstimatedReset) remote+='<br>Riprova automatica stimata dopo '+new Date(q.remoteEstimatedReset).toLocaleString('it-IT');
+      remote+='<br>Riprova automatica stimata dopo '+new Date(q.remoteEstimatedReset).toLocaleString('it-IT');
     }
-    document.getElementById('quota').innerHTML='<b>'+q.used+' / '+q.limit+'</b> richieste Cloudflare nelle ultime 24 h \xB7 stima residue <b>'+q.remaining+'</b>'+(q.nextReset?'<br>Prima quota locale che si libera: '+new Date(q.nextReset).toLocaleString('it-IT'):'')+remote+'<br><span class="muted">Contatore locale: non include vecchie chiamate o altri client.</span>';
+    document.getElementById('quota').innerHTML='<b>'+q.used+' / '+q.limit+'</b> richieste Cloudflare nelle ultime 24 h \xB7 stima residue <b>'+q.remaining+'</b>'+(q.nextReset?'<br>Prima quota locale che si libera: '+new Date(q.nextReset).toLocaleString('it-IT'):'')+remote+'<br><span class="muted">BMW Direct non è usato automaticamente. Sorgente live: Home Assistant.</span>';
   }
 }
 async function startAuth(){
