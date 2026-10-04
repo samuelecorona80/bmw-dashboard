@@ -1084,6 +1084,12 @@ var worker_default = {
         return await handleGetAnalytics(env, parseInt(url.searchParams.get("days") || "30"), cors);
       if (path === "/api/dump")
         return await handleDump(env, cors);
+      if (path === "/usage")
+        return serveUsage();
+      if (path === "/tyres")
+        return serveTyresPage();
+      if (path === "/maintenance")
+        return serveMaintenancePage();
       if (path === "/fuel")
         return serveFuel();
       if (path === "/api/fuel")
@@ -4080,6 +4086,29 @@ function serveConnection() {
   return new Response(html, { headers: { "Content-Type": "text/html;charset=utf-8" } });
 }
 __name(serveConnection, "serveConnection");
+function categoryShell(title, subtitle, body, script) {
+  return `<!doctype html><html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>BMW X3 M40d · ${title}</title><style>
+  :root{--bg:#07111d;--bg2:#091827;--card:#0c1b2d;--line:#274766;--text:#f4f7fb;--muted:#9fb2c7;--blue:#3f8cff;--green:#64e78b;--amber:#ffc65b;--red:#ff6b6b}*{box-sizing:border-box}body{margin:0;background:linear-gradient(180deg,var(--bg2),var(--bg));color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.shell{max-width:1120px;margin:auto;padding:20px}.top{display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:18px}.top h1{margin:0;font-size:26px}.sub,.muted{color:var(--muted);font-size:11px}.nav{display:flex;gap:7px;flex-wrap:wrap;margin:12px 0 20px}.nav a{color:#dce8f6;text-decoration:none;border:1px solid var(--line);background:#10233a;padding:7px 10px;border-radius:10px;font-size:11px}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.card{background:linear-gradient(180deg,rgba(17,37,60,.94),rgba(8,22,38,.94));border:1px solid rgba(74,112,148,.42);border-radius:16px;padding:16px}.card small{display:block;color:var(--muted);font-size:9px;text-transform:uppercase;letter-spacing:.06em}.card strong{display:block;font-size:22px;margin-top:5px}.section{margin-top:14px}.section h2{font-size:17px;margin:0 0 10px}.chart{height:280px}.tablewrap{overflow:auto;border:1px solid var(--line);border-radius:12px}table{width:100%;border-collapse:collapse;font-size:11px;white-space:nowrap}th,td{padding:8px 10px;border-bottom:1px solid rgba(39,71,102,.28);text-align:left}th{color:var(--muted);font-size:9px;text-transform:uppercase;background:#0d1b2c}.ok{color:var(--green)}.warn{color:var(--amber)}.bad{color:var(--red)}.wheelgrid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.wheel{border:1px solid var(--line);border-radius:13px;padding:14px;background:rgba(7,18,30,.35)}.wheel b{display:block;font-size:26px;margin:4px 0}.service-item{display:grid;grid-template-columns:1.5fr .7fr .8fr .8fr;gap:8px;padding:10px 0;border-bottom:1px solid rgba(39,71,102,.3);align-items:center}.pill{display:inline-block;padding:3px 7px;border-radius:999px;font-size:9px;background:rgba(100,231,139,.12);color:var(--green)}@media(max-width:760px){.grid{grid-template-columns:1fr 1fr}.wheelgrid{grid-template-columns:1fr}.service-item{grid-template-columns:1fr 1fr}.top{align-items:flex-start}.top h1{font-size:22px}}</style><script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"><\/script></head><body><main class="shell"><div class="top"><div><h1>${title}</h1><div class="sub">${subtitle}</div></div><a class="nav" href="/">← Dashboard</a></div><div class="nav"><a href="/usage">Utilizzo</a><a href="/trips">Viaggi</a><a href="/fuel">Carburante</a><a href="/tyres">Pneumatici</a><a href="/maintenance">Manutenzione</a><a href="/locations">Posizione</a><a href="/vehicle-info">Veicolo</a></div>${body}</main><script>${script}<\/script></body></html>`;
+}
+
+function serveUsage() {
+  const body = `<div class="grid" id="usageKpis"><div class="card" style="grid-column:1/-1"><span class="muted">Caricamento…</span></div></div><section class="section card"><h2>Trend mensile</h2><div class="muted">Km percorsi mese per mese</div><div class="chart"><canvas id="monthlyKm"></canvas></div></section><section class="section card"><h2>Intensità d’uso</h2><div class="muted">Km medi al giorno e giorni guidati</div><div class="chart"><canvas id="monthlyUse"></canvas></div></section><section class="section card"><h2>Ultimi giorni</h2><div class="tablewrap"><table><thead><tr><th>Data</th><th>Km</th><th>Odometro</th></tr></thead><tbody id="days"></tbody></table></div></section>`;
+  const script = `const fmt=v=>v==null?'—':Number(v).toLocaleString('it-IT',{maximumFractionDigits:1});fetch('/api/history/archive').then(r=>r.json()).then(d=>{const s=d.summary||{},i=d.insights||{},months=(i.monthlySeries||[]).slice(-12),long=i.longestDay||{},best=i.bestMonth||{};document.getElementById('usageKpis').innerHTML='<div class="card"><small>Km monitorati</small><strong>'+fmt(s.odometerDeltaKm)+' km</strong></div><div class="card"><small>Media al giorno</small><strong>'+fmt(i.avgKmPerCalendarDay)+' km</strong></div><div class="card"><small>Giorno di guida</small><strong>'+fmt(i.avgKmPerDrivingDay)+' km</strong></div><div class="card"><small>Stima annuale</small><strong>'+fmt(i.annualizedKm)+' km</strong></div><div class="card"><small>Giorno record</small><strong>'+fmt(long.km)+' km</strong><span class="muted">'+(long.date||'—')+'</span></div><div class="card"><small>Mese record</small><strong>'+fmt(best.km)+' km</strong><span class="muted">'+(best.month||'—')+'</span></div><div class="card"><small>Feriali</small><strong>'+fmt(i.weekdayAvgKm)+' km/g</strong></div><div class="card"><small>Weekend</small><strong>'+fmt(i.weekendAvgKm)+' km/g</strong></div>';const labels=months.map(x=>x.month),kms=months.map(x=>Number(x.km)||0),avg=months.map(x=>x.observedDays?(Number(x.km)||0)/Number(x.observedDays):0),dr=months.map(x=>Number(x.drivenDays)||0);new Chart(document.getElementById('monthlyKm'),{type:'bar',data:{labels,datasets:[{label:'km',data:kms,backgroundColor:'rgba(67,142,255,.78)',borderRadius:6}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{ticks:{color:'#9fb2c7'}},y:{ticks:{color:'#9fb2c7'}}}}});new Chart(document.getElementById('monthlyUse'),{type:'line',data:{labels,datasets:[{label:'km/giorno',data:avg,borderColor:'#64e78b',tension:.3},{label:'giorni guidati',data:dr,borderColor:'#ffc65b',tension:.3}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:'#dce8f6'}}},scales:{x:{ticks:{color:'#9fb2c7'}},y:{ticks:{color:'#9fb2c7'}}}}});document.getElementById('days').innerHTML=(d.days||[]).slice(0,30).map(x=>'<tr><td>'+x.date+'</td><td><b>'+fmt(x.distanceKm)+' km</b></td><td>'+fmt(x.endKm)+' km</td></tr>').join('');}).catch(e=>document.getElementById('usageKpis').innerHTML='<div class="card bad">'+e.message+'</div>');`;
+  return new Response(categoryShell("Utilizzo e trend","Km, medie, record e andamento mensile",body,script),{headers:{"Content-Type":"text/html;charset=utf-8"}});
+}
+
+function serveTyresPage() {
+  const body = `<div class="grid" id="tyreSummary"><div class="card" style="grid-column:1/-1"><span class="muted">Caricamento…</span></div></div><section class="section card"><h2>Pressioni attuali</h2><div class="wheelgrid" id="wheelGrid"></div></section><section class="section card"><h2>Storico pneumatici</h2><div class="tablewrap"><table><thead id="tyreHead"></thead><tbody id="tyreRows"></tbody></table></div></section>`;
+  const script = `const fmt=v=>v==null?'—':Number(v).toLocaleString('it-IT',{minimumFractionDigits:1,maximumFractionDigits:1});Promise.all([fetch('/api/data').then(r=>r.json()),fetch('/api/official/tires?limit=50').then(r=>r.json()).catch(()=>[])]).then(([d,h])=>{const t=d.tyres||{},vals=[t.frontLeft,t.frontRight,t.rearLeft,t.rearRight].filter(v=>v!=null),min=vals.length?Math.min(...vals):null,max=vals.length?Math.max(...vals):null;document.getElementById('tyreSummary').innerHTML='<div class="card"><small>Stato</small><strong class="'+(t.alerts&&t.alerts.any?'warn':'ok')+'">'+(t.alerts&&t.alerts.any?'Da controllare':'OK')+'</strong></div><div class="card"><small>Min pressione</small><strong>'+fmt(min)+' bar</strong></div><div class="card"><small>Max pressione</small><strong>'+fmt(max)+' bar</strong></div><div class="card"><small>Ultimo dato</small><strong style="font-size:14px">'+(t.bmwTimestamp?new Date(t.bmwTimestamp).toLocaleString('it-IT'):'—')+'</strong></div>';const wheels=[['Ant. sinistra',t.frontLeft,t.targetFrontLeft],['Ant. destra',t.frontRight,t.targetFrontRight],['Post. sinistra',t.rearLeft,t.targetRearLeft],['Post. destra',t.rearRight,t.targetRearRight]];document.getElementById('wheelGrid').innerHTML=wheels.map(w=>{const delta=w[1]!=null&&w[2]!=null?w[1]-w[2]:null;return '<div class="wheel"><small>'+w[0]+'</small><b>'+fmt(w[1])+' bar</b><span class="muted">Target '+fmt(w[2])+' · Δ '+(delta==null?'—':(delta>=0?'+':'')+fmt(delta))+'</span></div>'}).join('');if(Array.isArray(h)&&h.length){const cols=Object.keys(h[0]).slice(0,7);document.getElementById('tyreHead').innerHTML='<tr>'+cols.map(c=>'<th>'+c.replaceAll('_',' ')+'</th>').join('')+'</tr>';document.getElementById('tyreRows').innerHTML=h.map(r=>'<tr>'+cols.map(c=>'<td>'+String(r[c]??'—')+'</td>').join('')+'</tr>').join('');}}).catch(e=>document.getElementById('tyreSummary').innerHTML='<div class="card bad">'+e.message+'</div>');`;
+  return new Response(categoryShell("Pneumatici","Pressioni, target, alert e storico",body,script),{headers:{"Content-Type":"text/html;charset=utf-8"}});
+}
+
+function serveMaintenancePage() {
+  const body = `<div class="grid" id="maintKpis"><div class="card" style="grid-column:1/-1"><span class="muted">Caricamento…</span></div></div><section class="section card"><h2>Manutenzione programmata</h2><div id="serviceList"></div></section><section class="section card"><h2>Archivio CBS</h2><div class="tablewrap"><table><thead id="cbsHead"></thead><tbody id="cbsRows"></tbody></table></div></section>`;
+  const script = `Promise.all([fetch('/api/data').then(r=>r.json()),fetch('/api/official/cbs?limit=50').then(r=>r.json()).catch(()=>[])]).then(([d,h])=>{const s=d.service||{},b=d.battery12v||{},items=s.items||[],due=items.filter(x=>String(x.status).toUpperCase()!=='OK').length;document.getElementById('maintKpis').innerHTML='<div class="card"><small>Servizi monitorati</small><strong>'+items.length+'</strong></div><div class="card"><small>Da controllare</small><strong class="'+(due?'warn':'ok')+'">'+due+'</strong></div><div class="card"><small>Batteria 12V</small><strong class="'+(b.rechargeRequired?'warn':'ok')+'">'+(b.rechargeRequired?'Ricarica':'OK')+'</strong></div><div class="card"><small>Ultimo aggiornamento</small><strong style="font-size:14px">'+(s.bmwTimestamp?new Date(s.bmwTimestamp).toLocaleString('it-IT'):'—')+'</strong></div>';document.getElementById('serviceList').innerHTML=items.length?items.map(x=>'<div class="service-item"><div><b>'+x.title+'</b><div class="muted">'+(x.description||'')+'</div></div><div><span class="pill">'+x.status+'</span></div><div>'+x.date+'</div><div>'+x.kmRemaining+'</div></div>').join(''):'<div class="muted">Nessun elemento disponibile</div>';if(Array.isArray(h)&&h.length){const cols=Object.keys(h[0]).slice(0,7);document.getElementById('cbsHead').innerHTML='<tr>'+cols.map(c=>'<th>'+c.replaceAll('_',' ')+'</th>').join('')+'</tr>';document.getElementById('cbsRows').innerHTML=h.map(r=>'<tr>'+cols.map(c=>'<td>'+String(r[c]??'—')+'</td>').join('')+'</tr>').join('');}}).catch(e=>document.getElementById('maintKpis').innerHTML='<div class="card bad">'+e.message+'</div>');`;
+  return new Response(categoryShell("Manutenzione","CBS, service e batteria 12V",body,script),{headers:{"Content-Type":"text/html;charset=utf-8"}});
+}
+
 function serveDashboard() {
   return new Response(DASHBOARD_HTML, {
     headers: { "Content-Type": "text/html;charset=utf-8" }
@@ -4157,7 +4186,7 @@ var DASHBOARD_HTML = `<!DOCTYPE html>
 .trip-label{font-size:.7rem;color:var(--muted);text-transform:uppercase}
 
 
-.pill-button{font:inherit;cursor:pointer}.attention-panel{margin-top:16px;padding:14px 18px;border:1px solid rgba(255,198,91,.38);background:rgba(255,198,91,.08);border-radius:16px}.attention-panel.alert{border-color:rgba(255,107,107,.48);background:rgba(255,107,107,.08)}.attention-title{font-weight:800;margin-bottom:7px}.attention-items{display:flex;gap:7px;flex-wrap:wrap}.health-panel{margin-top:12px;padding:16px 18px}.health-head{display:flex;justify-content:space-between;align-items:center;gap:10px}.health-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:9px;margin-top:12px}.health-item{border:1px solid rgba(74,112,148,.32);border-radius:12px;padding:10px 12px;background:rgba(7,18,30,.28)}.health-item small,.health-item strong{display:block}.health-item small{color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.06em}.health-item strong{margin-top:4px;font-size:13px}.secondary-block{margin-top:18px}.secondary-block>summary{cursor:pointer;color:#c9d8e8;font-weight:750;padding:14px 18px;border:1px solid rgba(74,112,148,.36);border-radius:14px;background:rgba(12,27,45,.62);list-style:none}.secondary-block>summary::-webkit-details-marker{display:none}.secondary-block>summary:after{content:' +';float:right;color:var(--blue)}.secondary-block[open]>summary:after{content:' \u2212'}.secondary-block[open]>summary{margin-bottom:12px}@media(max-width:700px){.health-grid{grid-template-columns:1fr 1fr}.home-history-stats{grid-template-columns:1fr 1fr}.home-history-head{align-items:center}.home-history{padding:16px}}
+.pill-button{font:inherit;cursor:pointer}.attention-panel{margin-top:16px;padding:14px 18px;border:1px solid rgba(255,198,91,.38);background:rgba(255,198,91,.08);border-radius:16px}.attention-panel.alert{border-color:rgba(255,107,107,.48);background:rgba(255,107,107,.08)}.attention-title{font-weight:800;margin-bottom:7px}.attention-items{display:flex;gap:7px;flex-wrap:wrap}.health-panel{margin-top:12px;padding:16px 18px}.health-head{display:flex;justify-content:space-between;align-items:center;gap:10px}.health-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:9px;margin-top:12px}.health-item{border:1px solid rgba(74,112,148,.32);border-radius:12px;padding:10px 12px;background:rgba(7,18,30,.28)}.health-item small,.health-item strong{display:block}.health-item small{color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.06em}.health-item strong{margin-top:4px;font-size:13px}.secondary-block{margin-top:18px}.secondary-block>summary{cursor:pointer;color:#c9d8e8;font-weight:750;padding:14px 18px;border:1px solid rgba(74,112,148,.36);border-radius:14px;background:rgba(12,27,45,.62);list-style:none}.secondary-block>summary::-webkit-details-marker{display:none}.secondary-block>summary:after{content:' +';float:right;color:var(--blue)}.secondary-block[open]>summary:after{content:' \u2212'}.secondary-block[open]>summary{margin-bottom:12px}@media(max-width:700px){.health-grid{grid-template-columns:1fr 1fr}.home-history-stats{grid-template-columns:1fr 1fr}.home-history-head{align-items:center}.home-history{padding:16px}.topic-grid{grid-template-columns:1fr 1fr!important}}
 </style>
 
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
@@ -4194,12 +4223,12 @@ var DASHBOARD_HTML = `<!DOCTYPE html>
           <p>Chilometri, carburante, posizione, pneumatici e manutenzione.</p>
           <div class="hero-pills">
             <span class="pill" id="tripBadge" style="display:none;background:var(--amber);color:#000;animation:pulse 1.5s infinite">\u{1F3CE}\uFE0F In viaggio</span>
-             <a href="/vehicle-info" class="pill" style="text-decoration:none;background:rgba(67,142,255,.2);color:var(--accent)">\u{1F4CB} Scheda veicolo</a>
-             <a href="/trips" class="pill" style="text-decoration:none;background:rgba(92,221,142,.2);color:var(--green)">\u{1F5FA}\uFE0F Viaggi</a>
-             <a href="/fuel" class="pill" style="text-decoration:none;background:rgba(255,181,92,.2);color:#ffb55c">\u26FD Carburante</a>
-             <a href="/locations" class="pill" style="text-decoration:none;background:rgba(147,112,219,.2);color:#9370db">\u{1F4CD} Posizioni</a>
-             <a href="/history" class="pill" style="text-decoration:none;background:rgba(255,152,0,.2);color:#ff9800">\u{1F4DC} Cronologia</a>
-             <a href="/connection" class="pill" style="text-decoration:none;background:rgba(100,231,139,.12);color:var(--green)">\u{1F50C} Connessione</a>
+             <a href="/usage" class="pill" style="text-decoration:none;background:rgba(67,142,255,.2);color:#8eb9ff">📊 Utilizzo</a>
+             <a href="/trips" class="pill" style="text-decoration:none;background:rgba(92,221,142,.2);color:var(--green)">🗺️ Viaggi</a>
+             <a href="/fuel" class="pill" style="text-decoration:none;background:rgba(255,181,92,.2);color:#ffb55c">⛽ Carburante</a>
+             <a href="/tyres" class="pill" style="text-decoration:none;background:rgba(147,112,219,.2);color:#b69cff">🛞 Pneumatici</a>
+             <a href="/maintenance" class="pill" style="text-decoration:none;background:rgba(255,152,0,.16);color:#ffb35c">🔧 Manutenzione</a>
+             <a href="/locations" class="pill" style="text-decoration:none;background:rgba(147,112,219,.2);color:#9370db">📍 Posizione</a>
              <a href="/logout" class="pill hero-logout" style="text-decoration:none">Esci</a>
           </div>
           <div id="heroStats" style="margin-top:12px;font-size:13px;color:var(--muted);display:flex;flex-wrap:wrap;gap:8px 16px">
@@ -4252,7 +4281,18 @@ var DASHBOARD_HTML = `<!DOCTYPE html>
       <article class="quick-card"><span class="quick-icon">\u{1F17F}\uFE0F</span><div><small>Ultima posizione</small><strong id="quickStatus">\u2014</strong><em id="quickStatusNote">ultima posizione BMW</em></div></article>
     </section>
 
-    <section class="card home-history" id="homeHistory">
+    <section class="topic-grid" style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:16px">
+      <a href="/usage" class="card" style="padding:15px;text-decoration:none;color:var(--text)"><div class="card-kicker">Utilizzo</div><strong id="topicUsage" style="font-size:20px">—</strong><div class="mini-note">Trend, medie e record</div></a>
+      <a href="/fuel" class="card" style="padding:15px;text-decoration:none;color:var(--text)"><div class="card-kicker">Carburante</div><strong id="topicFuel" style="font-size:20px">—</strong><div class="mini-note">Livello, autonomia e costi</div></a>
+      <a href="/tyres" class="card" style="padding:15px;text-decoration:none;color:var(--text)"><div class="card-kicker">Pneumatici</div><strong id="topicTyres" style="font-size:20px">—</strong><div class="mini-note">Pressioni e storico</div></a>
+      <a href="/maintenance" class="card" style="padding:15px;text-decoration:none;color:var(--text)"><div class="card-kicker">Manutenzione</div><strong id="topicMaint" style="font-size:20px">—</strong><div class="mini-note">Service, CBS e batteria</div></a>
+      <a href="/trips" class="card" style="padding:15px;text-decoration:none;color:var(--text)"><div class="card-kicker">Viaggi</div><strong style="font-size:20px">Apri</strong><div class="mini-note">Percorsi e dettagli</div></a>
+      <a href="/locations" class="card" style="padding:15px;text-decoration:none;color:var(--text)"><div class="card-kicker">Posizione</div><strong id="topicLocation" style="font-size:20px">—</strong><div class="mini-note">Ultima posizione</div></a>
+      <a href="/vehicle-info" class="card" style="padding:15px;text-decoration:none;color:var(--text)"><div class="card-kicker">Veicolo</div><strong id="topicMileage" style="font-size:20px">—</strong><div class="mini-note">Scheda e chilometraggio</div></a>
+      <a href="/history" class="card" style="padding:15px;text-decoration:none;color:var(--text)"><div class="card-kicker">Dati</div><strong style="font-size:20px">Archivio</strong><div class="mini-note">Cronologia tecnica</div></a>
+    </section>
+
+    <section class="card home-history" id="homeHistory" style="display:none">
       <div class="home-history-head">
         <div>
           <div class="home-history-title">Storico BMW</div>
@@ -4271,7 +4311,7 @@ var DASHBOARD_HTML = `<!DOCTYPE html>
       </div>
     </section>
 
-    <section class="card history-insights">
+    <section class="card history-insights" style="display:none">
       <div class="home-history-head">
         <div>
           <div class="home-history-title">Insights dallo storico</div>
@@ -4286,7 +4326,7 @@ var DASHBOARD_HTML = `<!DOCTYPE html>
       <div id="historyInsightNote" class="history-insight-note"></div>
     </section>
 
-    <section class="card monthly-trends">
+    <section class="card monthly-trends" style="display:none">
       <div class="home-history-head">
         <div>
           <div class="home-history-title">Trend mensili</div>
@@ -4312,7 +4352,7 @@ var DASHBOARD_HTML = `<!DOCTYPE html>
       <div class="monthly-trend-note">I mesi parziali sono mostrati con i dati disponibili fino all’ultimo aggiornamento.</div>
     </section>
 
-    <section class="insight-grid">
+    <section class="insight-grid" style="display:none">
       <article class="card insight-card"><div class="card-kicker">Ultimo incremento odometro</div><strong id="lastMoveDistance">\u2014</strong><div class="mini-note" id="lastMoveNote">In attesa di dati odometro</div></article>
       <article class="card insight-card"><div class="card-kicker">Prossimo promemoria chilometrico</div><strong id="milestoneRemaining">\u2014</strong><div class="mini-note" id="milestoneNote">Stima in preparazione</div></article>
       <article class="card insight-card"><div class="card-kicker">Anomalie recenti</div><div id="anomalyList" class="mini-note">Analisi in corso\u2026</div></article>
@@ -4347,7 +4387,7 @@ var DASHBOARD_HTML = `<!DOCTYPE html>
       </article>
     </section>
 
-    <div class="period-bar" id="periodBar">
+    <div class="period-bar" id="periodBar" style="display:none">
       <button class="period-pill" data-days="1" onclick="selectPeriod(1)">1D</button>
       <button class="period-pill" data-days="7" onclick="selectPeriod(7)">7D</button>
       <button class="period-pill" data-days="30" onclick="selectPeriod(30)">30D</button>
@@ -4365,7 +4405,7 @@ var DASHBOARD_HTML = `<!DOCTYPE html>
     </div>
     <div class="analytics-spinner hidden" id="analyticsLoading"><div class="spinner small"></div></div>
 
-    <section class="analytics-grid" id="drivingSection">
+    <section class="analytics-grid" id="drivingSection" style="display:none">
       <article class="card compact-card"><div class="card-kicker">Distanza</div><div class="big-metric"><span id="distanceKm">\u2014</span><small> km</small></div><div class="metric-row-compact"><div><span class="metric-label">km/giorno</span><strong id="avgKmDay">\u2014</strong></div><div><span class="metric-label" id="activeLabel">km/giorno attivo</span><strong id="avgKmActive">\u2014</strong></div></div><div class="metric-row-compact"><div><span class="metric-label">Giorni guidati</span><strong id="drivingDaysVal">\u2014</strong></div><div><span class="metric-label">Pi\xF9 lungo</span><strong id="longestDayVal">\u2014</strong></div></div><div class="partial-badge hidden" id="drivingDaysCov">Copertura parziale</div></article>
       <article class="card compact-card"><div class="card-kicker">Consumo carburante</div><div class="big-metric"><span id="fuelKmL">\u2014</span><small> km/L</small> <span class="badge hidden" id="fuelBadge"></span></div><div class="mini-note hidden" id="fuelCoverage"></div></article>
       <article class="card chart-card"><div class="card-kicker">Distanza giornaliera</div><div class="chart-holder"><canvas id="dailyKmChart2"></canvas><div class="empty-state hidden" id="dailyKmEmpty2">In attesa di dati</div></div></article>
@@ -4373,7 +4413,7 @@ var DASHBOARD_HTML = `<!DOCTYPE html>
       <article class="card compact-card coverage-card"><div class="card-kicker">Copertura chilometraggio</div><div class="coverage-line"><span id="covFirst">\u2014</span> \u2192 <span id="covLast">\u2014</span> km</div><div class="coverage-dist"><span id="covDist">\u2014</span> km monitorati</div><div class="mini-note hidden" id="covGap"></div></article>
     </section>
 
-    <section class="lower-grid">
+    <section class="lower-grid" style="display:none">
       <article class="card tyres-card" style="padding:24px">
         <div class="section-head"><div><div class="card-kicker">Pneumatici</div><div class="mini-note">Trend rispetto alla precedente rilevazione valida</div></div><div class="tiny-time" id="tyreTimestamp">\u2014</div></div>
         <div class="tyre-alert-summary hidden" id="tyreAlertSummary">\u26A0 Pressione fuori target di oltre 0,5 bar</div>
@@ -4393,7 +4433,7 @@ var DASHBOARD_HTML = `<!DOCTYPE html>
     </section>
 
     <!-- Map + Vehicle Info -->
-    <section class="summary-grid" style="grid-template-columns:1fr 1fr">
+    <section class="summary-grid" style="grid-template-columns:1fr 1fr;display:none">
       <article class="card" style="padding:20px">
         <div class="card-kicker">\u{1F4CD} Posizione veicolo</div>
         <div id="mapContainer" style="height:280px;border-radius:12px;overflow:hidden;margin-top:8px;background:var(--bg2)">
@@ -4417,7 +4457,7 @@ var DASHBOARD_HTML = `<!DOCTYPE html>
       </article>
     </section>
 
-    <details class="secondary-block">
+    <details class="secondary-block" style="display:none">
       <summary>Altri dati BMW</summary>
     <section class="extra-grid" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px;margin-top:0">
       <article class="card" style="padding:20px">
@@ -4470,7 +4510,7 @@ var DASHBOARD_HTML = `<!DOCTYPE html>
 
     </details>
 
-    <section class="charts-grid">
+    <section class="charts-grid" style="display:none">
       <article class="card chart-card" style="padding:20px"><div class="card-kicker">Autonomia</div><canvas id="rangeChart"></canvas></article>
       <article class="card chart-card" style="padding:20px"><div class="card-kicker">Carburante</div><canvas id="fuelChart"></canvas></article>
       <article class="card chart-card" style="padding:20px"><div class="card-kicker">Pressione pneumatici</div><canvas id="tyreChart"></canvas><div class="mini-note chart-note">Linee tratteggiate = target BMW anteriori/posteriori.</div></article>
@@ -4687,6 +4727,12 @@ function renderAttention(d,direct){
 }
 
 function renderDashboard(d){
+  if($('topicMileage')) $('topicMileage').textContent=fmtInt(d.core.mileageKm)+' km';
+  if($('topicFuel')) $('topicFuel').textContent=(d.core.fuelPercent!=null?fmtInt(d.core.fuelPercent)+'%':'—')+(d.core.rangeKm!=null?' · '+fmtInt(d.core.rangeKm)+' km':'');
+  if($('topicLocation')) $('topicLocation').textContent=locationLabel(d.core.locationState);
+  if($('topicUsage')) $('topicUsage').textContent=d.distanceThisMonth!=null?fmtInt(d.distanceThisMonth)+' km mese':'Apri';
+  if($('topicTyres')) $('topicTyres').textContent=d.tyres&&d.tyres.alerts&&d.tyres.alerts.any?'Da controllare':'OK';
+  if($('topicMaint')) { const n=d.service&&d.service.items?d.service.items.filter(x=>String(x.status||'').toUpperCase()!=='OK').length:0; $('topicMaint').textContent=n?String(n)+' da controllare':'OK'; }
   $('mileage').textContent=fmtInt(d.core.mileageKm);
   $('fuelPercent').textContent=fmtInt(d.core.fuelPercent);
   $('fuelLitres').textContent=fmtInt(d.core.fuelLitres);
