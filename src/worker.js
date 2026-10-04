@@ -1784,7 +1784,7 @@ async function handleGetData(env, cors) {
       pushMileage(r.travelled_distance, r.c_timestamp, "CarData");
   } catch (_) {
   }
-  for (const r of dailyRows.results) {
+  for (const r of mergedDailyRows) {
     if (r.mileage_km !== null && r.mileage_km !== void 0) {
       pushMileage(r.mileage_km, r.snapshot_timestamp || r.snapshot_date + "T12:00:00Z", "Daily");
     }
@@ -2303,6 +2303,30 @@ async function handleGetAnalytics(env, days, cors) {
     return parseFloat(String(v).replace(",", "."));
   }, "toNum");
   const dailyRows = await db.prepare("SELECT * FROM bmw_daily ORDER BY snapshot_date ASC").all();
+  let mergedDailyRows = dailyRows.results || [];
+  try {
+    const officialRows = await db.prepare(`
+      SELECT local_date, mileage_start_km, closing_km, daily_distance_km, last_ts_utc
+      FROM bmw_official_daily
+      ORDER BY local_date ASC
+    `).all();
+    const official = officialRows.results || [];
+    if (official.length) {
+      const officialMax = official[official.length - 1].local_date;
+      const normalizedOfficial = official.map((r) => ({
+        snapshot_date: r.local_date,
+        snapshot_timestamp: r.last_ts_utc || (r.local_date + "T23:59:59Z"),
+        mileage_start_km: r.mileage_start_km,
+        mileage_km: r.closing_km,
+        daily_distance_km: r.daily_distance_km,
+        fuel_litres: null,
+        data_json: null
+      }));
+      const recentLive = (dailyRows.results || []).filter((r) => String(r.snapshot_date || "").slice(0,10) > officialMax);
+      mergedDailyRows = normalizedOfficial.concat(recentLive);
+    }
+  } catch (_) {
+  }
   const cardataRows = await db.prepare(
     "SELECT c_timestamp, travelled_distance FROM bmw_cardata_raw WHERE travelled_distance IS NOT NULL ORDER BY c_timestamp ASC"
   ).all();
@@ -3522,24 +3546,22 @@ function serveHistory() {
   <main class="shell">
     <section class="archive-card">
       <div class="archive-head">
-        <div><h2>Storico completo BMW</h2><div class="archive-sub">Storico ufficiale BMW importato una tantum + dati recenti Home Assistant, uniti in una sola timeline.</div></div>
-        <span class="source-pill source-ha">LIVE · Home Assistant</span>
+        <div><h2>Storico completo BMW</h2><div class="archive-sub">Cronologia completa della vettura, consolidata in una sola timeline.</div></div>
+        <span class="source-pill source-ha">DATI CONSOLIDATI</span>
       </div>
       <div id="archiveStats" class="archive-stats"><div class="loading" style="grid-column:1/-1;padding:18px">Caricamento storico completo…</div></div>
       <div class="archive-tools">
-        <button class="active" data-archive-filter="all" onclick="setArchiveFilter('all')">Tutto</button>
-        <button data-archive-filter="official" onclick="setArchiveFilter('official')">BMW ufficiale</button>
-        <button data-archive-filter="ha" onclick="setArchiveFilter('ha')">Home Assistant</button>
+        <button class="active" data-archive-filter="all" onclick="setArchiveFilter('all')">Timeline completa</button>
       </div>
       <div class="archive-table-wrap">
-        <table class="archive-table"><thead><tr><th>Data</th><th>Km inizio</th><th>Km fine</th><th>Km giorno</th><th>Carburante</th><th>Autonomia</th><th>Sorgente</th></tr></thead><tbody id="archiveRows"><tr><td colspan="7">Caricamento…</td></tr></tbody></table>
+        <table class="archive-table"><thead><tr><th>Data</th><th>Km inizio</th><th>Km fine</th><th>Km giorno</th><th>Carburante</th><th>Autonomia</th></tr></thead><tbody id="archiveRows"><tr><td colspan="6">Caricamento…</td></tr></tbody></table>
       </div>
       <button id="archiveMore" class="archive-more" onclick="showMoreArchive()">Mostra più giorni</button>
       <div id="archiveNote" class="archive-note"></div>
     </section>
 
     <section class="archive-card">
-      <div class="archive-head"><div><h2>Archivio BMW ufficiale</h2><div class="archive-sub">Tutti i dataset importati dal pacchetto BMW. Apri una categoria per sfogliare i record originali.</div></div></div>
+      <div class="archive-head"><div><h2>Dati tecnici e diagnostici</h2><div class="archive-sub">Telemetria, manutenzione e diagnostica disponibili nell’archivio dati della vettura.</div></div></div>
       <div id="datasetCards" class="dataset-grid"><div class="loading" style="grid-column:1/-1;padding:18px">Caricamento dataset…</div></div>
       <div id="datasetViewer" class="dataset-viewer hidden">
         <div class="dataset-view-head"><h3 id="datasetTitle">Dataset</h3><div class="pager"><button onclick="datasetPrev()">←</button><button onclick="datasetNext()">→</button></div></div>
@@ -3548,7 +3570,7 @@ function serveHistory() {
       </div>
     </section>
 
-    <div class="section-sep">Eventi recenti e stato aperture</div>
+    <div class="section-sep">Eventi e stato vettura</div>
 
     <div class="filter-section">
       <div class="filter-label">Quantit\xE0</div>
@@ -3614,15 +3636,14 @@ function serveHistory() {
         '<div class="archive-stat"><small>Odometro</small><strong>'+fmtKm(s.firstKm)+' → '+fmtKm(s.lastKm)+'</strong><span>Δ '+fmtKm(s.odometerDeltaKm)+'</span></div>'+
         '<div class="archive-stat"><small>BMW ufficiale</small><strong>'+s.officialDays+' giorni</strong><span>fino al '+fmtDateIt(s.officialThrough)+'</span></div>'+
         '<div class="archive-stat"><small>Home Assistant</small><strong>'+s.haDays+' giorni</strong><span>aggiornamento continuo</span></div>';
-      var rows=(archiveData.days||[]).filter(function(x){return archiveFilter==='all'||x.sourceKey===archiveFilter});
+      var rows=(archiveData.days||[]);
       var shown=rows.slice(0,archiveVisible);
       document.getElementById('archiveRows').innerHTML=shown.map(function(x){
         var fuel=x.fuelPercent!==null&&x.fuelPercent!==undefined?Number(x.fuelPercent).toLocaleString('it-IT')+'%':(x.fuelLitres!==null&&x.fuelLitres!==undefined?Number(x.fuelLitres).toLocaleString('it-IT')+' L':'—');
-        var src=x.sourceKey==='official'?'<span class="source-pill source-official">BMW ufficiale</span>':'<span class="source-pill source-ha">Home Assistant</span>';
-        return '<tr><td>'+fmtDateIt(x.date)+'</td><td>'+fmtKm(x.startKm)+'</td><td>'+fmtKm(x.endKm)+'</td><td><strong>'+fmtKm(x.distanceKm)+'</strong></td><td>'+fuel+'</td><td>'+fmtKm(x.rangeKm)+'</td><td>'+src+'</td></tr>';
-      }).join('')||'<tr><td colspan="7">Nessun dato</td></tr>';
+        return '<tr><td>'+fmtDateIt(x.date)+'</td><td>'+fmtKm(x.startKm)+'</td><td>'+fmtKm(x.endKm)+'</td><td><strong>'+fmtKm(x.distanceKm)+'</strong></td><td>'+fuel+'</td><td>'+fmtKm(x.rangeKm)+'</td></tr>';
+      }).join('')||'<tr><td colspan="6">Nessun dato</td></tr>';
       document.getElementById('archiveMore').style.display=rows.length>archiveVisible?'block':'none';
-      document.getElementById('archiveNote').textContent='La timeline usa BMW ufficiale fino al '+fmtDateIt(s.officialThrough)+' e Home Assistant per i giorni successivi. I dataset originali BMW restano consultabili sotto.';
+      document.getElementById('archiveNote').textContent='Timeline unica della vettura. I dati tecnici e diagnostici sono consultabili nella sezione sottostante.';
     }
     function renderDatasetCards(ds,off){
       var cards=[]; Object.keys(datasetConfig).forEach(function(k){var cfg=datasetConfig[k],x=ds[k]||off[k]||{},n=Number(x.rows||0);cards.push('<div class="dataset-card" onclick="openDataset(\''+k+'\')"><small>'+cfg.label+'</small><strong>'+n.toLocaleString('it-IT')+'</strong><small>record · apri</small></div>')});
@@ -4173,7 +4194,7 @@ var DASHBOARD_HTML = `<!DOCTYPE html>
         <div class="roundel" aria-hidden="true"></div>
         <div>
           <div class="brand-title">BMW X3 M40d</div>
-          <div class="brand-sub">Dashboard personale \xB7 BMW CarData</div>
+          <div class="brand-sub">Dashboard personale \xB7 Dati vettura</div>
         </div>
       </div>
       <div class="top-status">
@@ -4256,7 +4277,7 @@ var DASHBOARD_HTML = `<!DOCTYPE html>
       <div class="home-history-head">
         <div>
           <div class="home-history-title">Storico BMW</div>
-          <div class="home-history-sub">BMW ufficiale + Home Assistant in una sola timeline</div>
+          <div class="home-history-sub">Timeline completa della vettura</div>
         </div>
         <a class="home-history-link" href="/history">Apri storico completo →</a>
       </div>
@@ -4265,8 +4286,8 @@ var DASHBOARD_HTML = `<!DOCTYPE html>
       </div>
       <div class="home-history-table-wrap">
         <table class="home-history-table">
-          <thead><tr><th>Data</th><th>Km giorno</th><th>Odometro</th><th>Sorgente</th></tr></thead>
-          <tbody id="homeHistoryRows"><tr><td colspan="4">Caricamento…</td></tr></tbody>
+          <thead><tr><th>Data</th><th>Km giorno</th><th>Odometro</th></tr></thead>
+          <tbody id="homeHistoryRows"><tr><td colspan="3">Caricamento…</td></tr></tbody>
         </table>
       </div>
     </section>
@@ -4275,7 +4296,7 @@ var DASHBOARD_HTML = `<!DOCTYPE html>
       <div class="home-history-head">
         <div>
           <div class="home-history-title">Insights dallo storico</div>
-          <div class="home-history-sub">Medie, record, ritmo di utilizzo e consumo stimato dai dati disponibili</div>
+          <div class="home-history-sub">Medie, record, ritmo di utilizzo e consumo stimato sull’intera cronologia disponibile</div>
         </div>
         <a class="home-history-link" href="/history">Dettaglio storico →</a>
       </div>
@@ -4451,9 +4472,9 @@ var DASHBOARD_HTML = `<!DOCTYPE html>
     </section>
 
     <footer class="footer">
-      <div><strong>BMW X3 M40d</strong><span>Connected through BMW CarData</span></div>
+      <div><strong>BMW X3 M40d</strong><span>Dati vettura consolidati</span></div>
       <div><strong>Dati giornalieri</strong><span><span id="entitiesCount">\u2014</span> entit\xE0 monitorate</span></div>
-      <div><strong>Aggiornamento automatico</strong><span>Controllo ogni ora \xB7 dati aggiornati quando disponibili</span></div>
+      <div><strong>Aggiornamento automatico</strong><span>Dati aggiornati quando disponibili</span></div>
     </footer>
   </main>
 
@@ -4540,14 +4561,13 @@ function loadHomeHistory(){
     if(stats) stats.innerHTML=
       '<div class="home-history-stat"><small>Copertura</small><strong>'+escapeHtml((s.firstDate||'—')+' → '+(s.lastDate||'—'))+'</strong></div>'+
       '<div class="home-history-stat"><small>Odometro</small><strong>'+fmtInt(s.firstKm)+' → '+fmtInt(s.lastKm)+' km</strong></div>'+
-      '<div class="home-history-stat"><small>BMW ufficiale</small><strong>'+fmtInt(s.officialDays)+' giorni</strong></div>'+
-      '<div class="home-history-stat"><small>Home Assistant</small><strong>'+fmtInt(s.haDays)+' giorni</strong></div>';
+      '<div class="home-history-stat"><small>Km monitorati</small><strong>'+fmtInt(s.odometerDeltaKm)+' km</strong></div>'+
+      '<div class="home-history-stat"><small>Giorni disponibili</small><strong>'+fmtInt(s.dayRows)+'</strong></div>';
     const rows=(data.days||[]).slice(0,10);
     const body=document.getElementById('homeHistoryRows');
     if(body) body.innerHTML=rows.map(x=>{
-      const source=x.sourceKey==='official'?'<span class="home-src official">BMW ufficiale</span>':'<span class="home-src ha">Home Assistant</span>';
-      return '<tr><td>'+escapeHtml(x.date||'—')+'</td><td><strong>'+fmtInt(x.distanceKm)+' km</strong></td><td>'+fmtInt(x.endKm)+' km</td><td>'+source+'</td></tr>';
-    }).join('')||'<tr><td colspan="4">Nessun dato storico</td></tr>';
+      return '<tr><td>'+escapeHtml(x.date||'—')+'</td><td><strong>'+fmtInt(x.distanceKm)+' km</strong></td><td>'+fmtInt(x.endKm)+' km</td></tr>';
+    }).join('')||'<tr><td colspan="3">Nessun dato storico</td></tr>';
 
     const grid=document.getElementById('historyInsightsGrid');
     const fuel=(analyticsAll&&analyticsAll.fuel)||{};
@@ -4583,7 +4603,7 @@ function loadHomeHistory(){
       return '<div class="history-bar-wrap" title="'+escapeHtml(x.month+': '+fmtInt(x.km)+' km')+'"><div class="history-bar-value">'+fmtInt(x.km)+'</div><div class="history-bar" style="height:'+h+'%"></div><div class="history-bar-label">'+escapeHtml(label)+'</div></div>';
     }).join('');
     const note=document.getElementById('historyInsightNote');
-    if(note) note.textContent='Le medie chilometriche usano la timeline BMW ufficiale + Home Assistant. Il consumo è una stima separata basata solo sugli intervalli con dati carburante sufficienti.';
+    if(note) note.textContent='Le medie chilometriche usano l’intera timeline disponibile. Il consumo è stimato solo sugli intervalli con dati carburante sufficienti.';
   }).catch(err=>{
     const stats=document.getElementById('homeHistoryStats');
     if(stats) stats.innerHTML='<div class="home-history-stat" style="grid-column:1/-1"><small>Storico</small><strong>Non disponibile: '+escapeHtml(err.message||String(err))+'</strong></div>';
@@ -4603,12 +4623,12 @@ function renderDataHealth(d,direct){
   }).join('');
   if(direct){
     var q=direct.apiQuota||{};
-    html+='<div class="health-item"><small>Sorgente primaria</small><strong style="color:var(--green)">Home Assistant</strong><div class="mini-note">BavarianData \u2192 HA \u2192 D1</div></div>';
-    html+='<div class="health-item"><small>BMW Direct</small><strong style="color:var(--muted)">Fallback manuale</strong><div class="mini-note">'+(direct.lastFetchAt?'Ultimo test '+escapeHtml(formatTimestamp(direct.lastFetchAt)):'Nessun fetch automatico')+'</div></div>';
+    html+='<div class="health-item"><small>Flusso dati</small><strong style="color:var(--green)">Attivo</strong><div class="mini-note">Telemetria vettura aggiornata</div></div>';
+    html+='<div class="health-item"><small>Canale diretto</small><strong style="color:var(--muted)">Non necessario</strong><div class="mini-note">'+(direct.lastFetchAt?'Ultimo test '+escapeHtml(formatTimestamp(direct.lastFetchAt)):'Nessun fetch automatico')+'</div></div>';
     html+='<div class="health-item"><small>REST Worker</small><strong>'+(q.used??'\u2014')+'</strong><div class="mini-note">Richieste Worker tracciate nelle ultime 24h</div></div>';
-    if(pill){pill.textContent='\u25CF Flusso Home Assistant';pill.style.color='var(--green)';pill.style.borderColor='var(--green)';}
-    $('healthSummary').textContent='Home Assistant \xE8 la sorgente primaria. BMW Direct \xE8 disponibile solo come fallback manuale.';
-  } else if($('healthSummary')) $('healthSummary').textContent='Home Assistant \xE8 la sorgente primaria.';
+    if(pill){pill.textContent='\u25CF Flusso dati attivo';pill.style.color='var(--green)';pill.style.borderColor='var(--green)';}
+    $('healthSummary').textContent='Dati vettura consolidati e aggiornati.';
+  } else if($('healthSummary')) $('healthSummary').textContent='Dati vettura consolidati e aggiornati.';
   if(grid) grid.innerHTML=html;
 }
 function renderAttention(d,direct){
