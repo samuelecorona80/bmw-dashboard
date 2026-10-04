@@ -3282,6 +3282,43 @@ async function serveHistoryArchiveData(env, cors) {
     const firstKm = validStart ? Number(validStart.startKm) : null;
     const lastKm = validEnd ? Number(validEnd.endKm) : null;
     const knownDistance = days.reduce((sum, x) => sum + (Number.isFinite(Number(x.distanceKm)) ? Number(x.distanceKm) : 0), 0);
+    const firstDate = days.length ? days[0].date : null;
+    const lastDate = days.length ? days[days.length - 1].date : null;
+    const spanDays = firstDate && lastDate ? Math.max(1, Math.round((Date.parse(lastDate + "T12:00:00Z") - Date.parse(firstDate + "T12:00:00Z")) / 864e5) + 1) : days.length;
+    const odometerDeltaKm = firstKm !== null && lastKm !== null ? lastKm - firstKm : null;
+    const driven = days.filter((x) => Number(x.distanceKm) > 0);
+    const longestDay = driven.reduce((best, x) => Number(x.distanceKm) > Number(best?.distanceKm || 0) ? x : best, null);
+    const weekdayRows = days.filter((x) => { const d = new Date(x.date + "T12:00:00Z").getUTCDay(); return d >= 1 && d <= 5; });
+    const weekendRows = days.filter((x) => { const d = new Date(x.date + "T12:00:00Z").getUTCDay(); return d === 0 || d === 6; });
+    const avg = (rows) => rows.length ? rows.reduce((s, x) => s + (Number.isFinite(Number(x.distanceKm)) ? Number(x.distanceKm) : 0), 0) / rows.length : null;
+    const monthlyMap = {};
+    for (const x of days) {
+      const month = String(x.date || "").slice(0, 7);
+      if (!month) continue;
+      if (!monthlyMap[month]) monthlyMap[month] = { month, km: 0, observedDays: 0, drivenDays: 0 };
+      const dist = Number(x.distanceKm);
+      if (Number.isFinite(dist)) monthlyMap[month].km += dist;
+      monthlyMap[month].observedDays++;
+      if (dist > 0) monthlyMap[month].drivenDays++;
+    }
+    const monthlySeries = Object.values(monthlyMap).sort((a, b) => a.month.localeCompare(b.month)).map((x) => ({ ...x, km: Math.round(x.km) }));
+    const bestMonth = monthlySeries.reduce((best, x) => x.km > (best?.km || 0) ? x : best, null);
+    const latestMonth = monthlySeries.length ? monthlySeries[monthlySeries.length - 1] : null;
+    const insights = {
+      calendarSpanDays: spanDays,
+      observedDays: days.length,
+      drivenDays: driven.length,
+      avgKmPerCalendarDay: odometerDeltaKm !== null && spanDays ? Math.round(odometerDeltaKm / spanDays * 10) / 10 : null,
+      avgKmPerObservedDay: days.length ? Math.round(knownDistance / days.length * 10) / 10 : null,
+      avgKmPerDrivingDay: driven.length ? Math.round(knownDistance / driven.length * 10) / 10 : null,
+      annualizedKm: odometerDeltaKm !== null && spanDays ? Math.round(odometerDeltaKm / spanDays * 365) : null,
+      longestDay: longestDay ? { date: longestDay.date, km: Math.round(Number(longestDay.distanceKm) || 0) } : null,
+      weekdayAvgKm: weekdayRows.length ? Math.round(avg(weekdayRows) * 10) / 10 : null,
+      weekendAvgKm: weekendRows.length ? Math.round(avg(weekendRows) * 10) / 10 : null,
+      bestMonth,
+      latestMonth,
+      monthlySeries
+    };
     const [usage, tires, service, cbs, ccm, fasta] = await Promise.all([
       db.prepare("SELECT COUNT(*) rows, MIN(c_timestamp) min_ts, MAX(c_timestamp) max_ts FROM bmw_official_vusage").first(),
       db.prepare("SELECT COUNT(*) rows, MIN(timestamp_utc) min_ts, MAX(timestamp_utc) max_ts FROM bmw_official_tire_history").first(),
@@ -3292,17 +3329,18 @@ async function serveHistoryArchiveData(env, cors) {
     ]);
     return new Response(JSON.stringify({
       summary: {
-        firstDate: days.length ? days[0].date : null,
-        lastDate: days.length ? days[days.length - 1].date : null,
+        firstDate,
+        lastDate,
         dayRows: days.length,
         officialDays: official.length,
         haDays: live.length,
         firstKm,
         lastKm,
-        odometerDeltaKm: firstKm !== null && lastKm !== null ? lastKm - firstKm : null,
+        odometerDeltaKm,
         knownDistanceKm: knownDistance,
         officialThrough: officialMax
       },
+      insights,
       datasets: { usage, tires, service, cbs, ccm, fasta },
       days: days.reverse()
     }), { headers: { ...cors, "Content-Type": "application/json", "Cache-Control": "no-store" } });
@@ -4061,7 +4099,7 @@ var DASHBOARD_HTML = `<!DOCTYPE html>
 .topbar{display:flex;justify-content:space-between;align-items:center;padding:6px 8px 22px}.brand{display:flex;align-items:center;gap:14px}.brand-title{font-size:27px;font-weight:800}.brand-sub{color:var(--muted);font-size:14px}.roundel{width:54px;height:54px;border:3px solid #fff;border-radius:50%;background:conic-gradient(#fff 0 25%,#2494ff 0 50%,#fff 0 75%,#2494ff 0);box-shadow:0 0 0 3px #17202c inset}.top-status{display:flex;align-items:center;gap:14px}.eyebrow{font-size:12px;color:#9fb2c7;text-transform:uppercase;letter-spacing:.12em}.time{font-weight:700;margin-top:3px}.freshness{font-size:12px;color:var(--green);margin-top:5px}.freshness i{display:inline-block;width:8px;height:8px;background:var(--green);border-radius:50%;margin-right:6px}.refresh{width:42px;height:42px;border-radius:14px;border:1px solid var(--line);background:#10233a;color:#d9e8f8;font-size:23px;cursor:pointer}.refresh:hover{background:#153151}
 .card{background:linear-gradient(180deg,rgba(17,37,60,.94),rgba(8,22,38,.94));border:1px solid rgba(74,112,148,.42);border-radius:20px;box-shadow:0 20px 60px rgba(0,0,0,.18);overflow:hidden}.hero-grid{display:grid;grid-template-columns:minmax(0,1.5fr) minmax(310px,.7fr);gap:16px}.hero-card{min-height:330px;position:relative;padding:36px;display:flex;align-items:center;overflow:hidden;background:radial-gradient(circle at 78% 22%,rgba(52,126,214,.22),transparent 38%),linear-gradient(135deg,#07121f 0%,#0a1b2e 58%,#0d2238 100%)}.hero-card:after{content:"";position:absolute;inset:0;z-index:2;pointer-events:none;background:linear-gradient(90deg,rgba(5,13,22,.97) 0%,rgba(5,13,22,.92) 34%,rgba(5,13,22,.70) 56%,rgba(5,13,22,.32) 76%,rgba(5,13,22,.18) 100%),linear-gradient(180deg,rgba(6,14,24,.12) 0%,rgba(6,14,24,.08) 58%,rgba(6,14,24,.58) 100%)}.hero-copy{position:relative;z-index:4;max-width:450px}.hero-copy h1{font-size:56px;line-height:.96;margin:12px 0 18px;font-weight:300;letter-spacing:-.04em;text-shadow:0 2px 18px rgba(0,0,0,.35)}.hero-copy h1 span{color:#dce8f6}.hero-copy p{color:#c3d0de;max-width:380px;line-height:1.5;text-shadow:0 1px 10px rgba(0,0,0,.3)}.hero-pills{display:flex;gap:8px;flex-wrap:wrap;margin-top:22px}.pill{padding:8px 11px;border-radius:999px;border:1px solid rgba(108,146,184,.48);background:rgba(10,29,48,.86);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);font-size:12px;color:#d4e0ec;box-shadow:0 5px 18px rgba(0,0,0,.10)}.car-side{position:absolute;z-index:1;right:-3%;bottom:-2%;width:58%;opacity:.34;overflow:hidden;border-radius:0 0 20px 0;filter:saturate(.72) contrast(.86) brightness(.76) blur(.6px);transform:scale(1.02);transform-origin:bottom right;pointer-events:none}.car-side img{width:100%;display:block;border-radius:14px!important;filter:none!important}.car-side svg{width:100%;display:block}.hero-logout{position:absolute!important;top:18px;right:18px;z-index:5!important;background:rgba(7,20,33,.88)!important;color:#dce7f2!important;border-color:rgba(124,155,185,.42)!important}.mileage-card{padding:24px}.card-kicker{font-weight:750;font-size:15px;margin-bottom:14px}.big-number{font-size:44px;font-weight:800;letter-spacing:-.04em}.big-number small,.medium-number small,.analytics-value small{font-size:.45em;color:#d9e5f2}.mini-note{color:var(--muted);font-size:12px;line-height:1.45}.fresh-chip{display:inline-flex;align-items:center;gap:6px;padding:3px 8px;border-radius:999px;font-size:11px;font-weight:700}.fresh-chip.fresh{background:rgba(92,242,156,.12);color:var(--green)}.fresh-chip.stale{background:rgba(242,184,75,.12);color:var(--amber)}.fresh-chip.old,.fresh-chip.unknown{background:rgba(255,87,87,.10);color:#ff8f8f}.mileage-card canvas{margin-top:16px;max-height:150px}
 .quick-stats{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-top:16px}
-.home-history{margin-top:16px;padding:20px}.home-history-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:14px}.home-history-title{font-size:18px;font-weight:800}.home-history-sub{font-size:11px;color:var(--muted);margin-top:3px}.home-history-link{font-size:11px;color:#8eb9ff;text-decoration:none;border:1px solid rgba(67,142,255,.35);background:rgba(67,142,255,.10);padding:7px 10px;border-radius:10px;white-space:nowrap}.home-history-stats{display:grid;grid-template-columns:repeat(4,1fr);gap:9px;margin-bottom:12px}.home-history-stat{border:1px solid rgba(74,112,148,.32);border-radius:12px;background:rgba(7,18,30,.28);padding:10px 12px}.home-history-stat small{display:block;color:var(--muted);font-size:9px;text-transform:uppercase;letter-spacing:.06em}.home-history-stat strong{display:block;font-size:14px;margin-top:4px}.home-history-table-wrap{overflow:auto;border:1px solid rgba(74,112,148,.28);border-radius:12px}.home-history-table{width:100%;border-collapse:collapse;font-size:11px;white-space:nowrap}.home-history-table th,.home-history-table td{padding:8px 10px;border-bottom:1px solid rgba(39,71,102,.22);text-align:left}.home-history-table th{color:var(--muted);font-size:9px;text-transform:uppercase;letter-spacing:.04em;background:#0d1b2c}.home-src{display:inline-block;padding:3px 7px;border-radius:999px;font-size:9px;font-weight:700}.home-src.official{background:rgba(67,142,255,.14);color:#7fb2ff}.home-src.ha{background:rgba(46,165,92,.15);color:#5cf29c}.quick-card{min-height:104px;border:1px solid rgba(74,112,148,.38);border-radius:17px;background:linear-gradient(180deg,rgba(16,37,60,.88),rgba(9,24,40,.9));padding:16px;display:flex;align-items:center;gap:13px}.insight-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:16px}.insight-card{padding:18px 20px}.insight-card strong{display:block;font-size:24px;letter-spacing:-.03em;margin:4px 0 6px}.quick-icon{font-size:25px;filter:saturate(.85)}.quick-card small,.quick-card strong,.quick-card em{display:block}.quick-card small{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.08em}.quick-card strong{font-size:24px;margin:3px 0 1px}.quick-card em{font-size:10px;color:#7890a7;font-style:normal}
+.home-history{margin-top:16px;padding:20px}.home-history-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:14px}.home-history-title{font-size:18px;font-weight:800}.home-history-sub{font-size:11px;color:var(--muted);margin-top:3px}.home-history-link{font-size:11px;color:#8eb9ff;text-decoration:none;border:1px solid rgba(67,142,255,.35);background:rgba(67,142,255,.10);padding:7px 10px;border-radius:10px;white-space:nowrap}.home-history-stats{display:grid;grid-template-columns:repeat(4,1fr);gap:9px;margin-bottom:12px}.home-history-stat{border:1px solid rgba(74,112,148,.32);border-radius:12px;background:rgba(7,18,30,.28);padding:10px 12px}.home-history-stat small{display:block;color:var(--muted);font-size:9px;text-transform:uppercase;letter-spacing:.06em}.home-history-stat strong{display:block;font-size:14px;margin-top:4px}.home-history-table-wrap{overflow:auto;border:1px solid rgba(74,112,148,.28);border-radius:12px}.home-history-table{width:100%;border-collapse:collapse;font-size:11px;white-space:nowrap}.home-history-table th,.home-history-table td{padding:8px 10px;border-bottom:1px solid rgba(39,71,102,.22);text-align:left}.home-history-table th{color:var(--muted);font-size:9px;text-transform:uppercase;letter-spacing:.04em;background:#0d1b2c}.home-src{display:inline-block;padding:3px 7px;border-radius:999px;font-size:9px;font-weight:700}.home-src.official{background:rgba(67,142,255,.14);color:#7fb2ff}.home-src.ha{background:rgba(46,165,92,.15);color:#5cf29c}.history-insights{margin-top:16px;padding:20px}.history-insights-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.history-insight{border:1px solid rgba(74,112,148,.32);border-radius:13px;background:rgba(7,18,30,.28);padding:12px}.history-insight small{display:block;color:var(--muted);font-size:9px;text-transform:uppercase;letter-spacing:.06em}.history-insight strong{display:block;font-size:20px;margin-top:4px;letter-spacing:-.02em}.history-insight span{display:block;color:var(--muted);font-size:10px;margin-top:3px}.history-bars{display:grid;grid-template-columns:repeat(auto-fit,minmax(46px,1fr));align-items:end;gap:7px;height:150px;margin-top:16px;padding:10px 4px 0;border-top:1px solid rgba(74,112,148,.22)}.history-bar-wrap{height:100%;display:flex;flex-direction:column;justify-content:flex-end;align-items:center;gap:5px;min-width:0}.history-bar{width:100%;max-width:34px;min-height:3px;border-radius:7px 7px 3px 3px;background:linear-gradient(180deg,#5ba3ff,#3f8cff);opacity:.88}.history-bar-label{font-size:9px;color:var(--muted);white-space:nowrap}.history-bar-value{font-size:9px;color:#dce8f6;font-weight:700}.history-insight-note{margin-top:10px;font-size:10px;color:var(--muted);line-height:1.45}.consumption-confidence{display:inline-block;margin-left:5px;font-size:9px;padding:2px 6px;border-radius:999px;background:rgba(255,198,91,.12);color:var(--amber)}@media(max-width:900px){.history-insights-grid{grid-template-columns:repeat(2,1fr)}}@media(max-width:560px){.history-insights-grid{grid-template-columns:1fr 1fr}.history-bars{overflow-x:auto;grid-template-columns:repeat(10,52px);justify-content:start}}.quick-card{min-height:104px;border:1px solid rgba(74,112,148,.38);border-radius:17px;background:linear-gradient(180deg,rgba(16,37,60,.88),rgba(9,24,40,.9));padding:16px;display:flex;align-items:center;gap:13px}.insight-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:16px}.insight-card{padding:18px 20px}.insight-card strong{display:block;font-size:24px;letter-spacing:-.03em;margin:4px 0 6px}.quick-icon{font-size:25px;filter:saturate(.85)}.quick-card small,.quick-card strong,.quick-card em{display:block}.quick-card small{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.08em}.quick-card strong{font-size:24px;margin:3px 0 1px}.quick-card em{font-size:10px;color:#7890a7;font-style:normal}
 .summary-grid{display:grid;grid-template-columns:.78fr 1.05fr .65fr;gap:16px;margin-top:16px}.summary-grid .card{padding:24px}.metric-row{display:flex;align-items:baseline;gap:30px}.medium-number{font-size:40px;font-weight:800}.side-value{font-size:22px;font-weight:700;color:#d5e1ee}.progress{height:13px;border-radius:99px;background:#213951;margin:18px 0;overflow:hidden}.progress span{display:block;height:100%;width:0;background:linear-gradient(90deg,#53d79d,#4bd2bd);border-radius:99px;transition:width .6s}.submetric{display:flex;justify-content:space-between;align-items:end;color:var(--muted);font-size:13px}.submetric strong{display:block;color:white;font-size:24px}.status-main{font-size:27px;color:var(--green);font-weight:800;margin:-2px 0 12px}.check-list{display:grid;grid-template-columns:1fr 1fr;gap:10px 14px}.check-list div{display:flex;align-items:center;gap:8px;color:#d4dfeb;font-size:13px}.check-list b{width:24px;height:24px;display:grid;place-items:center;background:#1b6744;color:#8bf2a9;border-radius:50%;font-size:12px}.battery-card{text-align:center}.ok-disc{width:68px;height:68px;margin:4px auto 14px;border-radius:50%;display:grid;place-items:center;background:var(--green);color:#042416;font-size:34px;font-weight:900}.battery-msg{font-size:18px;font-weight:750;margin-bottom:14px}
 .advanced-grid{display:grid;grid-template-columns:1fr 1fr .82fr;gap:16px;margin-top:16px}.analytics-card,.trip-card{padding:22px;min-height:310px}.analytics-head{display:flex;align-items:flex-start;justify-content:space-between;gap:15px}.analytics-value{font-size:34px;font-weight:800;letter-spacing:-.03em}.analytics-average{font-size:11px;color:var(--muted);text-align:right}.analytics-average strong{display:block;color:#dce7f3;font-size:18px;margin-top:3px}.chart-holder{position:relative;height:185px;margin-top:16px}.chart-holder canvas{height:185px!important}.empty-state{position:absolute;inset:0;display:grid;place-items:center;text-align:center;color:var(--muted);border:1px dashed rgba(96,129,160,.35);border-radius:14px;background:rgba(7,18,30,.34);font-size:13px;padding:18px}.hidden{display:none!important}
 .trip-layout{display:grid;grid-template-columns:155px 1fr;align-items:center;gap:12px;height:230px}.donut-wrap{position:relative;width:150px;height:150px;margin:auto}.donut-wrap canvas{width:150px!important;height:150px!important}.donut-center{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;flex-direction:column;pointer-events:none}.donut-center strong{font-size:14px}.donut-center span{font-size:10px;color:var(--muted)}.trip-legend{display:grid;gap:11px}.trip-legend div{display:grid;grid-template-columns:9px 1fr auto;gap:8px;align-items:center;font-size:12px;color:#cdd9e5}.trip-legend i{width:9px;height:9px;border-radius:50%}.trip-legend strong{font-size:12px}.trip-legend .eco{background:#59d989}.trip-legend .eco-plus{background:#83e0c3}.trip-legend .electric{background:#4e9cff}.trip-legend .normal{background:#8497ac}
@@ -4231,6 +4269,21 @@ var DASHBOARD_HTML = `<!DOCTYPE html>
           <tbody id="homeHistoryRows"><tr><td colspan="4">Caricamento…</td></tr></tbody>
         </table>
       </div>
+    </section>
+
+    <section class="card history-insights">
+      <div class="home-history-head">
+        <div>
+          <div class="home-history-title">Insights dallo storico</div>
+          <div class="home-history-sub">Medie, record, ritmo di utilizzo e consumo stimato dai dati disponibili</div>
+        </div>
+        <a class="home-history-link" href="/history">Dettaglio storico →</a>
+      </div>
+      <div class="history-insights-grid" id="historyInsightsGrid">
+        <div class="history-insight" style="grid-column:1/-1"><small>Stato</small><strong>Calcolo insights…</strong></div>
+      </div>
+      <div id="historyMonthlyBars" class="history-bars"></div>
+      <div id="historyInsightNote" class="history-insight-note"></div>
     </section>
 
     <section class="insight-grid">
@@ -4475,9 +4528,14 @@ function loadDashboard(manual=false){
     });
 }
 function loadHomeHistory(){
-  fetch('/api/history/archive').then(r=>r.json()).then(data=>{
+  Promise.all([
+    fetch('/api/history/archive').then(r=>r.json()),
+    fetch('/api/analytics?days=0').then(r=>r.json()).catch(()=>({})),
+    fetch('/api/analytics?days=30').then(r=>r.json()).catch(()=>({}))
+  ]).then(all=>{
+    const data=all[0], analyticsAll=all[1]||{}, analytics30=all[2]||{};
     if(data.error) throw new Error(data.detail||data.error);
-    const s=data.summary||{};
+    const s=data.summary||{}, ins=data.insights||{};
     const stats=document.getElementById('homeHistoryStats');
     if(stats) stats.innerHTML=
       '<div class="home-history-stat"><small>Copertura</small><strong>'+escapeHtml((s.firstDate||'—')+' → '+(s.lastDate||'—'))+'</strong></div>'+
@@ -4487,12 +4545,50 @@ function loadHomeHistory(){
     const rows=(data.days||[]).slice(0,10);
     const body=document.getElementById('homeHistoryRows');
     if(body) body.innerHTML=rows.map(x=>{
-      const src=x.sourceKey==='official'?'<span class="home-src official">BMW ufficiale</span>':'<span class="home-src ha">Home Assistant</span>';
-      return '<tr><td>'+escapeHtml(x.date||'—')+'</td><td><strong>'+fmtInt(x.distanceKm)+' km</strong></td><td>'+fmtInt(x.endKm)+' km</td><td>'+src+'</td></tr>';
+      const source=x.sourceKey==='official'?'<span class="home-src official">BMW ufficiale</span>':'<span class="home-src ha">Home Assistant</span>';
+      return '<tr><td>'+escapeHtml(x.date||'—')+'</td><td><strong>'+fmtInt(x.distanceKm)+' km</strong></td><td>'+fmtInt(x.endKm)+' km</td><td>'+source+'</td></tr>';
     }).join('')||'<tr><td colspan="4">Nessun dato storico</td></tr>';
+
+    const grid=document.getElementById('historyInsightsGrid');
+    const fuel=(analyticsAll&&analyticsAll.fuel)||{};
+    const fuel30=(analytics30&&analytics30.fuel)||{};
+    const driving30=(analytics30&&analytics30.driving)||{};
+    const mileage30=(analytics30&&analytics30.mileage)||{};
+    const fuelKml=fuel30.kmPerLitre ?? fuel.kmPerLitre;
+    const fuelConf=fuel30.kmPerLitre!=null ? fuel30.consumptionConfidence : fuel.consumptionConfidence;
+    const confLabel=fuelConf==='reliable'?'affidabile':(fuelConf==='provisional'?'provvisorio':'dati insufficienti');
+    const longest=ins.longestDay||{};
+    const bestMonth=ins.bestMonth||{};
+    const weekendDelta=(ins.weekendAvgKm!=null&&ins.weekdayAvgKm!=null)?Math.round((ins.weekendAvgKm-ins.weekdayAvgKm)*10)/10:null;
+    if(grid) grid.innerHTML=
+      '<div class="history-insight"><small>Media al giorno</small><strong>'+fmt1(ins.avgKmPerCalendarDay)+' km</strong><span>media sull’intero periodo</span></div>'+
+      '<div class="history-insight"><small>Quando guidi</small><strong>'+fmt1(ins.avgKmPerDrivingDay)+' km</strong><span>media per giorno con movimento</span></div>'+
+      '<div class="history-insight"><small>Stima annuale</small><strong>'+fmtInt(ins.annualizedKm)+' km</strong><span>proiezione al ritmo storico</span></div>'+
+      '<div class="history-insight"><small>Giorno record</small><strong>'+fmtInt(longest.km)+' km</strong><span>'+escapeHtml(longest.date||'—')+'</span></div>'+
+      '<div class="history-insight"><small>Mese più attivo</small><strong>'+fmtInt(bestMonth.km)+' km</strong><span>'+escapeHtml(bestMonth.month||'—')+'</span></div>'+
+      '<div class="history-insight"><small>Giorni guidati</small><strong>'+fmtInt(ins.drivenDays)+'</strong><span>su '+fmtInt(ins.observedDays)+' giorni osservati</span></div>'+
+      '<div class="history-insight"><small>Ultimi 30 giorni</small><strong>'+fmtInt(mileage30.distanceKm)+' km</strong><span>'+fmt1(driving30.avgKmPerDay)+' km/giorno</span></div>'+
+      '<div class="history-insight"><small>Consumo stimato</small><strong>'+(fuelKml!=null?fmt1(fuelKml)+' km/L':'—')+'</strong><span>'+escapeHtml(confLabel)+(fuelKml!=null?'<i class="consumption-confidence">'+escapeHtml(confLabel)+'</i>':'')+'</span></div>'+
+      '<div class="history-insight"><small>Feriali</small><strong>'+fmt1(ins.weekdayAvgKm)+' km/g</strong><span>media giornaliera</span></div>'+
+      '<div class="history-insight"><small>Weekend</small><strong>'+fmt1(ins.weekendAvgKm)+' km/g</strong><span>'+(weekendDelta==null?'confronto n.d.':(weekendDelta>=0?'+':'')+fmt1(weekendDelta)+' km vs feriali')+'</span></div>'+
+      '<div class="history-insight"><small>Km monitorati</small><strong>'+fmtInt(s.odometerDeltaKm)+' km</strong><span>'+fmtInt(ins.calendarSpanDays)+' giorni di copertura</span></div>'+
+      '<div class="history-insight"><small>Carburante analizzato</small><strong>'+fmt1((fuel30.fuelConsumedL??fuel.fuelConsumedL))+' L</strong><span>'+fmtInt((fuel30.fuelCoveredKm??fuel.fuelCoveredKm))+' km coperti</span></div>';
+
+    const months=(ins.monthlySeries||[]).slice(-10);
+    const maxKm=Math.max(1,...months.map(x=>Number(x.km)||0));
+    const bars=document.getElementById('historyMonthlyBars');
+    if(bars) bars.innerHTML=months.map(x=>{
+      const h=Math.max(3,Math.round((Number(x.km)||0)/maxKm*100));
+      const label=String(x.month||'').slice(5,7)+'/'+String(x.month||'').slice(2,4);
+      return '<div class="history-bar-wrap" title="'+escapeHtml(x.month+': '+fmtInt(x.km)+' km')+'"><div class="history-bar-value">'+fmtInt(x.km)+'</div><div class="history-bar" style="height:'+h+'%"></div><div class="history-bar-label">'+escapeHtml(label)+'</div></div>';
+    }).join('');
+    const note=document.getElementById('historyInsightNote');
+    if(note) note.textContent='Le medie chilometriche usano la timeline BMW ufficiale + Home Assistant. Il consumo è una stima separata basata solo sugli intervalli con dati carburante sufficienti.';
   }).catch(err=>{
     const stats=document.getElementById('homeHistoryStats');
     if(stats) stats.innerHTML='<div class="home-history-stat" style="grid-column:1/-1"><small>Storico</small><strong>Non disponibile: '+escapeHtml(err.message||String(err))+'</strong></div>';
+    const grid=document.getElementById('historyInsightsGrid');
+    if(grid) grid.innerHTML='<div class="history-insight" style="grid-column:1/-1"><small>Insights</small><strong>Non disponibili</strong><span>'+escapeHtml(err.message||String(err))+'</span></div>';
   });
 }
 
