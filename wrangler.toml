@@ -1,5 +1,5 @@
 name = "bmw-dashboard"
-main = "src/worker.js"
+main = "src/x3-site.js"
 compatibility_date = "2024-01-01"
 keep_vars = true
 
@@ -8,3 +8,10 @@ binding = "DB"
 database_name = "bmw-vehicle-data"
 database_id = ""
 
+[[routes]]
+pattern = "bmw.samuelecorona.it"
+custom_domain = true
+
+[[routes]]
+pattern = "bmw-x3.samuelecorona.it"
+custom_domain = true
