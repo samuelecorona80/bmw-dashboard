@@ -9,9 +9,5 @@ database_name = "bmw-vehicle-data"
 database_id = ""
 
 [[routes]]
-pattern = "bmw.samuelecorona.it"
-custom_domain = true
-
-[[routes]]
 pattern = "bmw-x3.samuelecorona.it"
 custom_domain = true
